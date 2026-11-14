@@ -327,11 +327,9 @@ pub fn parse_episodes_page(v: &Value) -> (Vec<(u32, Episode)>, Option<String>) {
                 .filter_map(|item| {
                     let season =
                         item.get("seasonNumber")?.as_u64()? as u32;
-                    // The live API names this field "number"
-                    // (verified against the real payload,
-                    // 2026-11-14); "episodeNumber" was a
-                    // docs-based guess that silently dropped
-                    // every episode.
+                    // The live API names this field "number";
+                    // "episodeNumber" was a docs-based guess
+                    // that silently dropped every episode.
                     let number = item
                         .get("number")
                         .or_else(|| item.get("episodeNumber"))?
@@ -497,8 +495,8 @@ fn bucket_episodes(flat: Vec<(u32, Episode)>) -> Vec<(u32, Vec<Episode>)> {
 /// Fill missing titles / air dates in `primary` from `fallback`,
 /// matched by (season, episode number). The Chinese listing
 /// often carries the episode but leaves its name untranslated
-/// (null) — the English listing supplies it (verified live
-/// against Desperate Housewives, 2026-11-14).
+/// (null) — the English listing supplies it (verified
+/// against the live API).
 pub fn fill_episode_gaps(
     primary: &mut [(u32, Vec<Episode>)],
     fallback: &[(u32, Vec<Episode>)],

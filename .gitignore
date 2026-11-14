@@ -1,4 +1,9 @@
 /target/
-/VideoTag.app/
-/*.log
+*.app/
+*.dmg
 .DS_Store
+.cargo/
+*.log
+dist/
+packaging/macos/ffmpeg
+packaging/macos/ffmpeg.parts/

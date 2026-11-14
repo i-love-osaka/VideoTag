@@ -5,7 +5,7 @@
 //! VIDEO_TVDB_KEY=<key> cargo test -p videotag-sources --test live_tvdb -- --ignored
 //! ```
 //!
-//! Added 2026-11-14 after the fixture-drift bug: the episodes
+//! Written after a fixture-drift bug: the episodes
 //! fixture used the documented field name `episodeNumber`,
 //! while the live API actually sends `number` — every episode
 //! was silently dropped and all TVDB renames fell back to

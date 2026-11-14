@@ -186,7 +186,7 @@ fn load_settings() -> Settings {
     // Credentials pasted from a chat or a web page often carry a
     // trailing newline or stray spaces — TheTVDB rejects such a
     // key outright ("apikey invalid"), after which EVERY TVDB
-    // match fails (user's bug, 2026-11-14). Normalize on load and
+    // match fails. Normalize on load and
     // on store so a dirty saved key heals itself.
     out.api_key = out.api_key.trim().to_string();
     let tvdb_trimmed = out.tvdb_api_key.trim().to_string();
@@ -349,8 +349,7 @@ fn is_hidden(path: &Path) -> bool {
 /// NAS system folders (Synology's @eaDir holds transcoded copies
 /// of the real videos — pure duplicates), recycle/trash and OS
 /// metadata folders, and trailer/sample extras folders, which are
-/// not episodes of the work (user: filter unrelated files when
-/// opening a directory, 2026-11-14). Season directories such as
+/// not episodes of the work. Season directories such as
 /// Specials are NOT junk and stay.
 fn is_junk_dir(name: &str) -> bool {
     let n = name.trim().to_lowercase();
@@ -479,8 +478,8 @@ fn make_row(path: PathBuf, root: &Path, work: usize, subs: &[PathBuf]) -> Row {
     let small = size > 0 && size < SMALL_LIMIT;
     let subtitles = subtitles_for(&path, subs);
     Row {
-        // Every row starts checked (user's rule, 2026-11-14: a
-        // freshly opened directory is fully selected). Small files
+        // Every row starts checked: a freshly opened directory
+        // is fully selected. Small files
         // and extras keep their 附属 marking in the list; they are
         // just no longer excluded from the default selection.
         checked: true,
@@ -1232,8 +1231,7 @@ fn row_target(row: &Row, settings: &Settings) -> Option<PathBuf> {
 
 /// Why a row's target conflicts. The two kinds paint the file
 /// name the same red but need opposite remedies, so the status
-/// column names the kind and a hover tooltip explains it
-/// (user's question, 2026-11-14).
+/// column names the kind and a hover tooltip explains it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConflictKind {
     /// Another row aims at the same target path.
@@ -1352,9 +1350,8 @@ fn streamed_copy(src: &Path, dst: &Path) -> Result<(), String> {
 /// server's copy offload, so the bytes may never cross this
 /// machine either. But `cp -p` exits 1 on network volumes when
 /// its final step — restoring timestamps/attributes the share
-/// won't accept — fails, even though every byte already landed
-/// (user's Mandalorian run, 2026-11-14: all 24 rows “cp exit
-/// status: 1” after minutes of copying each). So a failed cp
+/// won't accept — fails, even though every byte already landed.
+/// So a failed cp
 /// whose target matches the source length counts as copied;
 /// anything else falls back to the streamed copy, and the
 /// error keeps cp's own words for the next diagnosis.
@@ -1572,9 +1569,9 @@ struct VideoTagApp {
     last_platform: IdPlatform,
     /// Save-destination dialog (opened by the 保存修改 toolbar
     /// button): pick an export folder, reuse the last one, or
-    /// rename in place — then execution starts (user's flow,
-    /// 2026-11-14; the destination no longer lives in Settings,
-    /// `settings.output_dir` just remembers the last export dir).
+    /// rename in place — then execution starts (the destination
+    /// no longer lives in Settings; `settings.output_dir` just
+    /// remembers the last export dir).
     show_save_dialog: bool,
     batch_rx: Option<Receiver<MatchEvent>>,
     batch_running: bool,
@@ -1681,7 +1678,7 @@ impl VideoTagApp {
         // probing only reads headers, and small files are exactly
         // the ones whose names carry no tech tokens; skipping
         // them left whole packs of small episodes with no audio/
-        // video info at all (user's bug, 2026-11-14).
+        // video info at all.
         let probe_paths: Vec<PathBuf> =
             new_rows.iter().map(|r| r.path.clone()).collect();
         self.roots.push(root);
@@ -1778,9 +1775,9 @@ impl VideoTagApp {
         }
     }
 
-    /// Adding a directory starts from a clean list (user's call,
-    /// 2026-11-14: one batch at a time — old rows must not linger
-    /// into the next folder's work). View-only: no file is touched.
+    /// Adding a directory starts from a clean list: one batch
+    /// at a time — old rows must not linger into the next
+    /// folder's work. View-only: no file is touched.
     /// In-flight probe results for vanished paths are ignored by
     /// `poll_probe`, so clearing mid-probe is safe.
     fn clear_list(&mut self) {
@@ -1873,8 +1870,8 @@ impl VideoTagApp {
         // Byte-progress watcher: while a row's copy runs, this
         // thread stats the growing target file a few times a
         // second and reports landed bytes. Counting rows alone
-        // made a multi-GB file look frozen for minutes (user:
-        // “还是不动”, 2026-11-14) — the bytes are the truth.
+        // made a multi-GB file look frozen for minutes — the
+        // bytes are the truth.
         let watch: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let watch_active = Arc::new(AtomicBool::new(true));
         let watch2 = Arc::clone(&watch);
@@ -2034,8 +2031,8 @@ impl VideoTagApp {
                         t(self.lang, "失败", "failed"),
                         failed
                     );
-                    // A successful save empties the list (user's
-                    // call, 2026-11-14): rows that fully landed
+                    // A successful save empties the list: rows
+                    // that fully landed
                     // leave. Failed rows stay untouched, and so
                     // do partial rows (video landed, a subtitle
                     // did not) — their error still needs eyes.
@@ -2054,9 +2051,9 @@ impl VideoTagApp {
         }
     }
 
-    /// Modal progress window shown while a save executes
-    /// (user's request, 2026-11-14): cross-volume saves can be
-    /// slow, and the status-bar counter alone left the app
+    /// Modal progress window shown while a save executes.
+    /// Cross-volume saves can be slow, and the status-bar
+    /// counter alone left the app
     /// looking hung. The Modal's backdrop blocks input to the
     /// rest of the UI until the run finishes; the window shows
     /// the progress bar, the counts so far, and the file being
@@ -2073,8 +2070,8 @@ impl VideoTagApp {
             ui.set_width(520.0);
             // Generous inner margin: with the bare default frame
             // the content sat right against the modal's edges
-            // and felt cramped (user screenshot, 2026-11-14) —
-            // same breathing-room fix as the settings window.
+            // and felt cramped — same breathing-room fix as
+            // the settings window.
             egui::Frame::new()
                 .inner_margin(egui::Margin::symmetric(20, 18))
                 .show(ui, |ui| {
@@ -2123,7 +2120,7 @@ impl VideoTagApp {
     /// work indices to the surviving works, and forget roots
     /// whose rows are all gone — a root that stays registered
     /// with an empty list makes re-adding that directory bounce
-    /// off the duplicate check (user's bug report, 2026-11-14).
+    /// off the duplicate check.
     fn prune_after_row_removal(&mut self) {
         self.picker = None;
         self.selected = None;
@@ -2177,7 +2174,7 @@ impl VideoTagApp {
     /// whose toolbar button was clicked. A work carrying that
     /// platform's id is looked up directly; anything else is
     /// title-searched on that platform only. There is no
-    /// cross-platform fallback (user's call, 2026-11-14).
+    /// cross-platform fallback.
     fn start_match(&mut self, platform: IdPlatform) {
         if self.busy() {
             return;
@@ -2821,8 +2818,8 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     file_menu.append(&save_m).ok()?;
     menu.append(&file_menu).ok()?;
 
-    // The Edit menu mirrors the toolbar one-to-one (menu/toolbar
-    // unification, 2026-11-14): selection group, Set ID, then one
+    // The Edit menu mirrors the toolbar one-to-one: selection
+    // group, Set ID, then one
     // match item per platform — the toolbar has three distinct
     // platform commands, so the menu names all three instead of
     // hiding the remembered platform behind a generic label.
@@ -2848,8 +2845,8 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     edit_menu.append(&match_bangumi_m).ok()?;
     menu.append(&edit_menu).ok()?;
 
-    // Help menu (user's call, 2026-11-14): About moved here
-    // from the app menu, plus a link to his homepage. The
+    // Help menu: About moved here from the app menu, plus a
+    // link to the author's homepage. The
     // GitHub entry is a placeholder — VideoTag has no repo
     // yet; it gets a real URL (and handler) at open-source time.
     let help_menu = Submenu::new(t(lang, "帮助", "Help"), true);
@@ -2964,8 +2961,8 @@ impl VideoTagApp {
             } else if id == &homepage_id {
                 open_url("https://mrben.net");
             } else if id == &github_id {
-                // Placeholder until the VideoTag repo exists
-                // (user's call, 2026-11-14): no destination yet.
+                // Placeholder until the VideoTag repo exists:
+                // no destination yet.
             }
         }
     }
@@ -3234,8 +3231,8 @@ fn paint_text_ink_left(
 
 /// A progress bar with its text painted ink-centered: the
 /// stock egui bar centers its label by line box, so with
-/// PingFang the text rides a few pixels high inside the bar
-/// (user screenshot, 2026-11-14). The label is painted twice —
+/// PingFang the text rides a few pixels high inside the bar.
+/// The label is painted twice —
 /// once in the plain text color over the track, once in white
 /// clipped to the filled part — like the stock bar's two-tone
 /// label, but ink-centered both times.
@@ -3276,8 +3273,8 @@ fn progress_bar_ink(ui: &mut egui::Ui, frac: f32, text: &str) {
 /// A settings checkbox row, hand-painted like the list rows:
 /// the stock egui checkbox centers its label by line box, and
 /// PingFang's ink sits above the line-box center, so the label
-/// always looked a few pixels high next to the box (user
-/// screenshot, 2026-11-14). Here the box is centered on the
+/// always looked a few pixels high next to the box. Here
+/// the box is centered on the
 /// row and the label is painted ink-centered on the same line.
 /// Clicking anywhere on the row toggles. Returns true when the
 /// value changed.
@@ -3582,8 +3579,8 @@ impl eframe::App for VideoTagApp {
                             self.remove_checked();
                         }
                         toolbar_separator(ui);
-                        // 指定 ID leads the match group (user's
-                        // order, 2026-11-14): Set ID, then the three
+                        // 指定 ID leads the match group: Set ID,
+                        // then the three
                         // platform buttons, then 保存修改 — one
                         // group, no separators inside.
                         if toolbar_button(ui, TbIcon::SetId, t(self.lang, "指定 ID", "Set ID"), has_rows && self.any_checked() && !self.busy()) {
@@ -3591,15 +3588,14 @@ impl eframe::App for VideoTagApp {
                             self.id_platform = self.last_platform;
                             self.show_id_dialog = true;
                         }
-                        // Manual platform buttons (user's call,
-                        // 2026-11-14): click one and matching runs
+                        // Manual platform buttons: click one and
+                        // matching runs
                         // on that platform only — no automatic
                         // cross-platform chain. TVDB greys out
                         // without a key; TMDB without a key still
                         // clicks through to the settings guidance
                         // in start_match. While a batch runs, the
-                        // layout must NOT change (user flagged the
-                        // toolbar reshaping, 2026-11-14): the
+                        // layout must NOT change while it runs: the
                         // running platform's own button turns into
                         // 停止 in place, the other two just grey
                         // out.
@@ -3627,11 +3623,10 @@ impl eframe::App for VideoTagApp {
                                 }
                             }
                         }
-                        // 指定 ID / 平台匹配 / 保存修改 are ONE group
-                        // (user's call, 2026-11-14 — same ruling as
-                        // MusicTag: no separator before the apply
-                        // button, and the apply button is labelled
-                        // 保存修改 in both output modes). Clicking it
+                        // 指定 ID / 平台匹配 / 保存修改 are ONE group:
+                        // no separator before the apply button, and
+                        // the apply button is labelled 保存修改 in
+                        // both output modes. Clicking it
                         // opens the save-destination dialog; conflicts
                         // do not disable it — the dialog's choice of
                         // root re-decides them before executing.
@@ -3884,8 +3879,7 @@ impl eframe::App for VideoTagApp {
                     }
                     // "More" button: opens this work's candidate picker.
                     // The status text and this button form one unit,
-                    // centered across the row's two lines (user's
-                    // call, 2026-11-14).
+                    // centered across the row's two lines.
                     if !work.candidates.is_empty() {
                         let btn_rect = egui::Rect::from_center_size(
                             egui::pos2(rect.right() - 35.0, rect.center().y),
@@ -4151,8 +4145,8 @@ impl VideoTagApp {
     /// Save-destination dialog: the 保存修改 button opens this.
     /// The user picks where the checked files go — export folder,
     /// the last export folder again, or rename in place — and
-    /// execution starts immediately on the choice (user's flow,
-    /// 2026-11-14; this replaces the Settings-based output dir).
+    /// execution starts immediately on the choice (this
+    /// replaces the Settings-based output dir).
     fn save_dialog_window(&mut self, ctx: &egui::Context) {
         let lang = self.lang;
         let mut open = self.show_save_dialog;
@@ -4257,7 +4251,7 @@ impl VideoTagApp {
             .collapsible(false)
             // Generous inner margins: the default window margin
             // (8) left the content hugging the edges and the
-            // window felt packed (user, 2026-11-14).
+            // window felt packed.
             .frame(egui::Frame::window(&ctx.style()).inner_margin(egui::Margin {
                 left: 22,
                 right: 22,
@@ -4359,8 +4353,8 @@ impl VideoTagApp {
                     changed = true;
                 }
                 // The save destination used to live here; it moved
-                // onto the 保存修改 button's dialog (user's call,
-                // 2026-11-14). settings.output_dir now only
+                // onto the 保存修改 button's dialog.
+                // settings.output_dir now only
                 // remembers the last export folder for that dialog.
             });
         self.show_settings = open;
@@ -4691,8 +4685,7 @@ fn show_about_window(ctx: &egui::Context, show_about: &mut bool, lang: Lang) {
                     ui.add_space(12.0);
                     // The blurb is broken into two lines by hand:
                     // left to auto-wrap it shed an orphan “件。”
-                    // onto a line of its own (user screenshot,
-                    // 2026-11-14).
+                    // onto a line of its own.
                     ui.label(
                         egui::RichText::new(t(
                             lang,
@@ -4893,7 +4886,7 @@ mod tests {
 
     #[test]
     fn house_episode_file_name_uses_chinese_show_title() {
-        // The user's House example under the Chinese-first rule,
+        // House example under the Chinese-first rule,
         // assembled the way build_preview assembles it.
         let cand = candidate("豪斯医生", "House", "House");
         let wt = WorkTitle {
@@ -4989,7 +4982,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The user's case: a show's folder is added directly and its
+    /// Case: a show's folder is added directly and its
     /// files are 01.mkv .. 12.mkv. One TV work named after the
     /// folder, episodes 1..12 in season 1 — not twelve "movies"
     /// named "01", "02", ...
@@ -5186,7 +5179,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The user's second case: the show folder itself is the root
+    /// Second case: the show folder itself is the root
     /// and its name carries a TMDB id. The numbered files form one
     /// work whose identity (title + id) comes from the root name,
     /// so matching goes by id lookup.

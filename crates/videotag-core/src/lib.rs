@@ -954,13 +954,13 @@ fn is_short_ascii_prefix(segment: &str) -> bool {
 }
 
 fn extract_directory_title(name: &str) -> String {
-    // NOTE (user rule, 2026-11-14, fifth point still to come): the
-    // recognition priority for *searching* is 1) TMDB id, 2) the
-    // full directory name, 3) the 《》 name, 4) the dash-segment
-    // name. This function still extracts the single display/search
-    // title in the older order (《》 > dash > cleaned full name);
-    // when matching grows multiple search terms, try them in the
-    // priority order above rather than baking this order in.
+    // NOTE: the recognition priority for *searching* is
+    // 1) platform id, 2) the full directory name, 3) the 《》
+    // name, 4) the dash-segment name. This function extracts the
+    // single display/search title in the older order (《》 > dash
+    // > cleaned full name); when matching grows multiple search
+    // terms, try them in the priority order above rather than
+    // baking this order in.
     // 《...》 wins wherever it appears.
     if let Some(start) = name.find('《') {
         let inner_start = start + '《'.len_utf8();
@@ -1665,7 +1665,7 @@ pub fn build_relative_path(
 }
 
 // ---------------------------------------------------------------------------
-// library layout (the user's current media-library format)
+// library layout (the target media-library format)
 //
 // Work folder: `[6.1] [2013] [TMDB-00115782]《乔布斯》(Jobs)`
 //   - the score segment is always present; unrated works (no votes)
@@ -1985,7 +1985,7 @@ mod tests {
 
     #[test]
     fn tv_file_name_user_library_format() {
-        // The user's current library layout, from his own example:
+        // The target library layout, from a real example:
         // a placeholder episode title (TMDB has no name for it),
         // its air date, and hyphen-joined tech tags.
         let work = WorkTitle {
@@ -2048,7 +2048,7 @@ mod tests {
 
     #[test]
     fn tv_file_name_user_example_from_extracted_tags() {
-        // The user's locked example, end to end: tags extracted
+        // The reference example, end to end: tags extracted
         // from a download-style name (channels kept as written —
         // `2ch` and `2.0` coexist) must rebuild his exact string.
         let work = WorkTitle {
@@ -2455,7 +2455,7 @@ path,
 
     #[test]
     fn numbered_group_maps_a_full_season() {
-        // The user's layout: a show folder full of 01.mkv .. 12.mkv.
+        // Layout: a show folder full of 01.mkv .. 12.mkv.
         let names: Vec<String> = (1..=12).map(|ep| format!("{ep:02}.mkv")).collect();
         let refs: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
         let found = detect_numbered_episodes(&refs);
@@ -2514,7 +2514,7 @@ path,
 
     #[test]
     fn file_path_numeric_file_takes_work_dir_identity() {
-        // The user's folder, added as a root: the file is episode 1
+        // A show folder added as a root: the file is episode 1
         // of the show the directory names, not a work called "01".
         let p = parse_file_path("101次求婚-TMDB48455/01.mkv");
         assert_eq!(p.title, "101次求婚");
