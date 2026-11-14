@@ -1,0 +1,22 @@
+[package]
+name = "videotag-app"
+version = "0.1.0"
+edition = "2021"
+description = "VideoTag desktop app — match movies and shows on TMDB, rename into a tidy library layout."
+license = "MIT"
+
+[[bin]]
+name = "VideoTag"
+path = "src/main.rs"
+
+[dependencies]
+videotag-core = { path = "../videotag-core" }
+videotag-sources = { path = "../videotag-sources" }
+eframe = { version = "0.31", default-features = false, features = ["glow", "x11", "wayland"] }
+serde_json = "1"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+rfd = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.17"

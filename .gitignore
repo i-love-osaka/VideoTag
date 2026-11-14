@@ -1,0 +1,4 @@
+/target/
+/VideoTag.app/
+/*.log
+.DS_Store
