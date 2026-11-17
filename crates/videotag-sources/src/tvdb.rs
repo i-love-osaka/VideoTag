@@ -456,10 +456,25 @@ fn fetch_episode_listing(
     series_id: u64,
     code: &str,
 ) -> Result<Vec<(u32, Episode)>> {
+    let mut flat: Vec<(u32, Episode)> = Vec::new();
+    fetch_episode_listing_paged(creds, series_id, code, &mut |page| {
+        flat.extend(page);
+    })?;
+    Ok(flat)
+}
+
+/// The episode listing, page by page: each page's episodes are
+/// handed to `on_page` as soon as they arrive (the listing is
+/// ordered by season, then episode).
+fn fetch_episode_listing_paged(
+    creds: &TvdbCredentials,
+    series_id: u64,
+    code: &str,
+    on_page: &mut dyn FnMut(Vec<(u32, Episode)>),
+) -> Result<()> {
     let mut url = Some(format!(
         "{BASE}/series/{series_id}/episodes/default/{code}"
     ));
-    let mut flat: Vec<(u32, Episode)> = Vec::new();
     let mut pages = 0;
     while let Some(page_url) = url.take() {
         pages += 1;
@@ -469,13 +484,13 @@ fn fetch_episode_listing(
         match authed_get(creds, &page_url)? {
             Some(v) => {
                 let (eps, next) = parse_episodes_page(&v);
-                flat.extend(eps);
+                on_page(eps);
                 url = next;
             }
             None => break, // 404: no listing in this language
         }
     }
-    Ok(flat)
+    Ok(())
 }
 
 fn bucket_episodes(flat: Vec<(u32, Episode)>) -> Vec<(u32, Vec<Episode>)> {
@@ -535,11 +550,33 @@ pub fn get_episodes(
     series_id: u64,
     lang: TmdbLanguage,
 ) -> Result<Vec<(u32, Vec<Episode>)>> {
+    get_episodes_streaming(creds, series_id, lang, &mut |_| {})
+}
+
+/// Like `get_episodes`, but each fetched page's episodes are
+/// also reported (bucketed by season) as they arrive, so a
+/// caller can start using a series' early seasons while the
+/// later pages are still downloading. When the fallback
+/// language fills gaps at the end, the corrected full set is
+/// reported once more as a final chunk.
+pub fn get_episodes_streaming(
+    creds: &TvdbCredentials,
+    series_id: u64,
+    lang: TmdbLanguage,
+    on_chunk: &mut dyn FnMut(Vec<(u32, Vec<Episode>)>),
+) -> Result<Vec<(u32, Vec<Episode>)>> {
     let (primary, fallback) = match lang {
         TmdbLanguage::ZhCn => ("zho", Some("eng")),
         TmdbLanguage::EnUs => ("eng", None),
     };
-    let mut result = bucket_episodes(fetch_episode_listing(creds, series_id, primary)?);
+    let mut flat: Vec<(u32, Episode)> = Vec::new();
+    fetch_episode_listing_paged(creds, series_id, primary, &mut |page| {
+        if !page.is_empty() {
+            on_chunk(bucket_episodes(page.clone()));
+        }
+        flat.extend(page);
+    })?;
+    let mut result = bucket_episodes(flat);
     if let Some(code) = fallback {
         let incomplete = result.is_empty()
             || result.iter().any(|(_, eps)| {
@@ -555,6 +592,7 @@ pub fn get_episodes(
                 } else {
                     fill_episode_gaps(&mut result, &fb);
                 }
+                on_chunk(result.clone());
             }
         }
     }

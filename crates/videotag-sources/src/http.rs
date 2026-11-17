@@ -87,10 +87,18 @@ pub fn send(req: &Request) -> Result<(u32, String)> {
         args.push(body.to_string());
     }
     args.push(req.url.to_string());
-    let out = Command::new("curl")
-        .args(&args)
+    let mut cmd = Command::new("curl");
+    cmd.args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Windows: curl is a console program — without this flag every
+    // request flashes a console window from the GUI app.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd
         .output()
         .map_err(|e| SourceError::Http(format!("cannot run curl: {e}")))?;
     if !out.status.success() {

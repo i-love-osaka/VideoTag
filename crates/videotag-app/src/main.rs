@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use videotag_core::{IdPlatform, NameLang, ParsedName, WorkTitle};
@@ -96,6 +96,20 @@ fn detect_lang() -> Lang {
                 return if text.starts_with("zh") { Lang::Zh } else { Lang::En };
             }
         }
+    }
+    // Windows: ask the OS for the user's display language
+    // (LANGID primary language 0x04 = Chinese).
+    #[cfg(target_os = "windows")]
+    {
+        unsafe extern "system" {
+            fn GetUserDefaultUILanguage() -> u16;
+        }
+        let langid = unsafe { GetUserDefaultUILanguage() };
+        return if langid & 0x3FF == 0x04 {
+            Lang::Zh
+        } else {
+            Lang::En
+        };
     }
     for key in ["LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(v) = std::env::var(key) {
@@ -392,14 +406,38 @@ fn is_sample_file(path: &Path) -> bool {
 /// Recursively collect video and subtitle files under a work
 /// directory. Hidden entries and BDMV (Blu-ray) trees are skipped.
 fn collect_work_files(dir: &Path, videos: &mut Vec<PathBuf>, subs: &mut Vec<PathBuf>) {
+    collect_work_files_inner(dir, videos, subs, 0);
+}
+
+/// Recursive walk behind `collect_work_files`, hardened for the
+/// huge, messy trees a media library can be: directory symlinks
+/// and junctions are never descended into (a junction cycle on
+/// Windows used to recurse until the stack overflowed — the
+/// "hangs, then crashes" bug), and depth is capped as a second
+/// line of defence.
+fn collect_work_files_inner(
+    dir: &Path,
+    videos: &mut Vec<PathBuf>,
+    subs: &mut Vec<PathBuf>,
+    depth: usize,
+) {
+    const MAX_DEPTH: usize = 40;
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    let mut entries: Vec<(PathBuf, bool)> = rd
+        .flatten()
+        .map(|e| {
+            // `file_type` does not follow symlinks: a symlinked
+            // directory reports as a symlink, not a directory.
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            (e.path(), is_dir)
+        })
+        .collect();
     entries.sort();
-    for path in entries {
+    for (path, is_dir) in entries {
         if is_hidden(&path) {
             continue;
         }
-        if path.is_dir() {
+        if is_dir {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -407,7 +445,9 @@ fn collect_work_files(dir: &Path, videos: &mut Vec<PathBuf>, subs: &mut Vec<Path
             if is_junk_dir(&name) {
                 continue;
             }
-            collect_work_files(&path, videos, subs);
+            if depth < MAX_DEPTH {
+                collect_work_files_inner(&path, videos, subs, depth + 1);
+            }
         } else {
             match ext_of(&path).as_str() {
                 e if VIDEO_EXTS.contains(&e) => {
@@ -881,6 +921,29 @@ struct WorkJob {
 
 enum MatchEvent {
     WorkSearching { work: usize },
+    WorkProgress { work: usize, phase: PhaseMsg },
+    /// The candidate is picked and its detail fetched. Sent
+    /// for progress only: the UI does not apply it (the list
+    /// stays untouched behind the progress modal); the complete
+    /// result arrives with `WorkDone`. The payload is carried
+    /// for the matcher's own reporting symmetry and is
+    /// deliberately unread on the UI side.
+    #[allow(dead_code)]
+    WorkFound {
+        work: usize,
+        candidates: Vec<Candidate>,
+        chosen: usize,
+        detail: Option<Candidate>,
+    },
+    /// One chunk of episode lists for a work, as it arrived
+    /// (a season from TMDB, a page from TVDB, the whole list
+    /// from Bangumi). Progress only, like `WorkFound`: the UI
+    /// drops these; `WorkDone` carries the assembled set.
+    #[allow(dead_code)]
+    WorkEpisodes {
+        work: usize,
+        episodes: Vec<(u32, Vec<Episode>)>,
+    },
     WorkDone {
         work: usize,
         candidates: Vec<Candidate>,
@@ -890,6 +953,75 @@ enum MatchEvent {
     },
     WorkFailed { work: usize },
     Finished { matched: usize, failed: usize },
+}
+
+/// Progress phases of one work's match, reported by the matcher
+/// so the status line can show what is happening inside a
+/// (possibly long) single-work match — a batch of one big show
+/// otherwise sits at "0/1" for its whole duration.
+enum PhaseMsg {
+    /// Title search started.
+    Searching,
+    /// A candidate was picked; its detail record and episode
+    /// lists are being fetched. Carries the display title.
+    Found(String),
+    /// Episode lists: seasons fetched so far / total wanted.
+    /// TMDB reports per season; TVDB and Bangumi fetch in one
+    /// call and report 0/1 then 1/1 around it.
+    Episodes(usize, usize),
+}
+
+/// One work's finished match, stashed while the batch runs.
+/// The list is not touched during matching at all (the modal
+/// design): results collect in `pending_results` and are
+/// written into the works only after the batch finishes, by
+/// the apply pass (`ApplyState`).
+enum PendingResult {
+    Done {
+        work: usize,
+        candidates: Vec<Candidate>,
+        chosen: usize,
+        detail: Option<Candidate>,
+        episodes: Vec<(u32, Vec<Episode>)>,
+    },
+    Failed {
+        work: usize,
+    },
+}
+
+/// The post-match apply pass: writes the stashed results into
+/// the list work by work, row by row, sliced across frames
+/// under a small time budget, so even a huge library fills in
+/// without one long frame. `final_status` (the batch summary)
+/// is shown when the pass completes.
+struct ApplyState {
+    queue: VecDeque<PendingResult>,
+    current: Option<ApplyWork>,
+    final_status: String,
+    works_total: usize,
+    works_done: usize,
+}
+
+/// One work mid-application: its result is already written
+/// into the `Work`; its rows' previews are rebuilt in slices,
+/// then the conflict recount/reflag passes run in slices too
+/// (the same three passes `refresh_work_previews` runs whole).
+struct ApplyWork {
+    work: usize,
+    row_ids: Vec<usize>,
+    affected: HashSet<PathBuf>,
+    recount: HashMap<String, usize>,
+    phase: ApplyPhase,
+    /// Rebuild: index into `row_ids`. Recount/Reflag: index
+    /// into the app's row list.
+    cursor: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyPhase {
+    Rebuild,
+    Recount,
+    Reflag,
 }
 
 /// Result of fetching one picked candidate's detail + episodes
@@ -910,16 +1042,20 @@ fn fetch_episodes(
     cand: &Candidate,
     seasons: &[u32],
     lang: TmdbLanguage,
+    report: &dyn Fn(PhaseMsg),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
 ) -> Vec<(u32, Vec<Episode>)> {
     let mut out = Vec::new();
     if cand.media_type != MediaType::Tv {
         return out;
     }
-    for season in seasons {
+    for (i, season) in seasons.iter().enumerate() {
         if let Ok(eps) = videotag_sources::get_episodes(key, cand.id, *season, lang) {
+            sink(vec![(*season, eps.clone())]);
             out.push((*season, eps));
         }
         throttle();
+        report(PhaseMsg::Episodes(i + 1, seasons.len()));
     }
     out
 }
@@ -934,9 +1070,13 @@ fn fetch_episodes_for(
     cfg: &SourceConfig,
     cand: &Candidate,
     seasons: &[u32],
+    report: &dyn Fn(PhaseMsg),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
 ) -> Vec<(u32, Vec<Episode>)> {
     match cand.source {
-        IdPlatform::Tmdb => fetch_episodes(&cfg.tmdb_key, cand, seasons, cfg.lang),
+        IdPlatform::Tmdb => {
+            fetch_episodes(&cfg.tmdb_key, cand, seasons, cfg.lang, report, sink)
+        }
         IdPlatform::Tvdb => {
             let Some(creds) = &cfg.tvdb else {
                 return Vec::new();
@@ -944,21 +1084,31 @@ fn fetch_episodes_for(
             if cand.media_type != MediaType::Tv {
                 return Vec::new();
             }
-            let all = videotag_sources::tvdb::get_episodes(creds, cand.id, cfg.lang)
-                .unwrap_or_default();
+            report(PhaseMsg::Episodes(0, 1));
+            let all = videotag_sources::tvdb::get_episodes_streaming(
+                creds,
+                cand.id,
+                cfg.lang,
+                &mut |chunk| sink(chunk),
+            )
+            .unwrap_or_default();
             throttle();
+            report(PhaseMsg::Episodes(1, 1));
             all.into_iter()
                 .filter(|(season, _)| seasons.contains(season))
                 .collect()
         }
         IdPlatform::Bangumi => {
+            report(PhaseMsg::Episodes(0, 1));
             let eps = videotag_sources::bangumi::get_episodes(cand.id).unwrap_or_default();
             throttle();
+            report(PhaseMsg::Episodes(1, 1));
             if eps.is_empty() {
                 return Vec::new();
             }
             let target = if seasons.len() == 1 { seasons[0] } else { 1 };
             if seasons.is_empty() || seasons.contains(&target) {
+                sink(vec![(target, eps.clone())]);
                 vec![(target, eps)]
             } else {
                 Vec::new()
@@ -1059,7 +1209,13 @@ type MatchOutcome = (
 
 /// Title search on TMDB only: the structure's type first, the
 /// other type when that finds nothing (existing behavior).
-fn tmdb_search_match(cfg: &SourceConfig, job: &WorkJob) -> Option<MatchOutcome> {
+fn tmdb_search_match(
+    cfg: &SourceConfig,
+    job: &WorkJob,
+    report: &dyn Fn(PhaseMsg),
+    found: &dyn Fn(&[Candidate], usize, &Option<Candidate>),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
+) -> Option<MatchOutcome> {
     let key = &cfg.tmdb_key;
     let lang = cfg.lang;
     let primary = if job.is_tv {
@@ -1078,11 +1234,17 @@ fn tmdb_search_match(cfg: &SourceConfig, job: &WorkJob) -> Option<MatchOutcome> 
         throttle();
         cands = other.unwrap_or_default();
     }
-    finish_search(cfg, cands, job)
+    finish_search(cfg, cands, job, report, found, sink)
 }
 
 /// Title search on TheTVDB only, same type-fallback shape.
-fn tvdb_search_match(cfg: &SourceConfig, job: &WorkJob) -> Option<MatchOutcome> {
+fn tvdb_search_match(
+    cfg: &SourceConfig,
+    job: &WorkJob,
+    report: &dyn Fn(PhaseMsg),
+    found: &dyn Fn(&[Candidate], usize, &Option<Candidate>),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
+) -> Option<MatchOutcome> {
     let creds = cfg.tvdb.as_ref()?;
     let primary = if job.is_tv {
         videotag_sources::tvdb::search_tv(creds, &job.title, job.year, cfg.lang)
@@ -1100,18 +1262,24 @@ fn tvdb_search_match(cfg: &SourceConfig, job: &WorkJob) -> Option<MatchOutcome> 
         throttle();
         cands = other.unwrap_or_default();
     }
-    finish_search(cfg, cands, job)
+    finish_search(cfg, cands, job, report, found, sink)
 }
 
 /// Title search on Bangumi only. Subjects are series-shaped, so
 /// movies search here too — the user picked the platform, the
 /// pick counts (the [2, 6] subject filter includes animated and
 /// live-action films).
-fn bangumi_search_match(cfg: &SourceConfig, job: &WorkJob) -> Option<MatchOutcome> {
+fn bangumi_search_match(
+    cfg: &SourceConfig,
+    job: &WorkJob,
+    report: &dyn Fn(PhaseMsg),
+    found: &dyn Fn(&[Candidate], usize, &Option<Candidate>),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
+) -> Option<MatchOutcome> {
     let cands =
         videotag_sources::bangumi::search_subjects(&job.title, cfg.lang).unwrap_or_default();
     throttle();
-    finish_search(cfg, cands, job)
+    finish_search(cfg, cands, job, report, found, sink)
 }
 
 /// Shared tail of a title search on any platform: pick the best
@@ -1122,16 +1290,23 @@ fn finish_search(
     cfg: &SourceConfig,
     cands: Vec<Candidate>,
     job: &WorkJob,
+    report: &dyn Fn(PhaseMsg),
+    found: &dyn Fn(&[Candidate], usize, &Option<Candidate>),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
 ) -> Option<MatchOutcome> {
     if cands.is_empty() {
         return None;
     }
     let chosen = videotag_sources::pick_best(&cands, &job.title, job.year)?;
     let pick = cands[chosen].clone();
+    report(PhaseMsg::Found(pick.title.clone()));
     let detail = fetch_detail(cfg, &pick);
     throttle();
+    // The pick is final from here: hand it to the UI now so the
+    // work shows as matched while the episode lists stream in.
+    found(&cands, chosen, &detail);
     let canonical = detail.clone().unwrap_or_else(|| pick.clone());
-    let episodes = fetch_episodes_for(cfg, &canonical, &job.seasons);
+    let episodes = fetch_episodes_for(cfg, &canonical, &job.seasons, report, sink);
     Some((cands, chosen, detail, episodes))
 }
 
@@ -1142,19 +1317,25 @@ fn match_one(
     cfg: &SourceConfig,
     platform: IdPlatform,
     job: &WorkJob,
+    report: &dyn Fn(PhaseMsg),
+    found: &dyn Fn(&[Candidate], usize, &Option<Candidate>),
+    sink: &dyn Fn(Vec<(u32, Vec<Episode>)>),
 ) -> Option<MatchOutcome> {
+    report(PhaseMsg::Searching);
     if let Some(id) = job.pinned_id {
         let cand = lookup_id(cfg, platform, id, job.is_tv)?;
-        let episodes = fetch_episodes_for(cfg, &cand, &job.seasons);
+        report(PhaseMsg::Found(cand.title.clone()));
+        found(&[cand.clone()], 0, &Some(cand.clone()));
+        let episodes = fetch_episodes_for(cfg, &cand, &job.seasons, report, sink);
         return Some((vec![cand.clone()], 0, Some(cand), episodes));
     }
     if job.title.trim().is_empty() {
         return None;
     }
     match platform {
-        IdPlatform::Tmdb => tmdb_search_match(cfg, job),
-        IdPlatform::Tvdb => tvdb_search_match(cfg, job),
-        IdPlatform::Bangumi => bangumi_search_match(cfg, job),
+        IdPlatform::Tmdb => tmdb_search_match(cfg, job, report, found, sink),
+        IdPlatform::Tvdb => tvdb_search_match(cfg, job, report, found, sink),
+        IdPlatform::Bangumi => bangumi_search_match(cfg, job, report, found, sink),
     }
 }
 
@@ -1164,6 +1345,17 @@ fn match_one(
 
 enum ProbeEvent {
     Done { path: PathBuf, tags: Vec<String> },
+}
+
+/// One library root finished its background scan (see
+/// `maybe_start_scan`): the works and rows `scan_root` built for
+/// it, ready to be merged by `apply_scanned_root`.
+enum ScanEvent {
+    Done {
+        root: PathBuf,
+        works: Vec<Work>,
+        rows: Vec<Row>,
+    },
 }
 
 /// The ffmpeg used for probing: the copy bundled in the app's
@@ -1197,11 +1389,15 @@ fn ffmpeg_path() -> PathBuf {
 /// out of its stderr. Any failure yields no tags (the caller
 /// falls back to the name-parsed ones).
 fn probe_one(ffmpeg: &Path, file: &Path) -> Vec<String> {
-    let Ok(out) = std::process::Command::new(ffmpeg)
-        .arg("-i")
-        .arg(file)
-        .output()
-    else {
+    let mut cmd = std::process::Command::new(ffmpeg);
+    cmd.arg("-i").arg(file);
+    // Windows: probing runs once per file — no console window per probe.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let Ok(out) = cmd.output() else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stderr);
@@ -1247,9 +1443,13 @@ enum ConflictKind {
 /// when a file already sits there that is not the row's own
 /// source. Execution never overwrites anything. A duplicate
 /// target outranks an existing file when both apply.
+/// The batch form of the conflict rules (production code
+/// judges rows incrementally via `kind_for`); kept for tests.
+#[cfg(test)]
 fn conflicting_kinds(
     sources: &[PathBuf],
     targets: &[PathBuf],
+    exists_cache: &mut HashMap<PathBuf, bool>,
 ) -> Vec<Option<ConflictKind>> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for target in targets {
@@ -1264,13 +1464,75 @@ fn conflicting_kinds(
             let key = target.to_string_lossy().to_lowercase();
             if counts.get(&key).copied().unwrap_or(0) > 1 {
                 Some(ConflictKind::Duplicate)
-            } else if target != src && target.exists() {
+            } else if target != src
+                && *exists_cache
+                    .entry(target.clone())
+                    .or_insert_with(|| target.exists())
+            {
+                // Existence is cached across refreshes: statting
+                // every target on every refresh (thousands of
+                // NAS/SMB stats per frame during matching) froze
+                // the UI. Only never-seen targets are statted.
                 Some(ConflictKind::TargetExists)
             } else {
                 None
             }
         })
         .collect()
+}
+
+/// The counts-map key for a target path (conflict counting is
+/// case-insensitive, matching `conflicting_kinds`).
+fn target_key(target: &Path) -> String {
+    target.to_string_lossy().to_lowercase()
+}
+
+/// One row's conflict kind, judged against the app-wide target
+/// counts and the existence cache (the incremental counterpart
+/// of `conflicting_kinds`, which judges a whole batch at once).
+fn kind_for(
+    counts: &HashMap<String, usize>,
+    exists_cache: &mut HashMap<PathBuf, bool>,
+    src: &Path,
+    target: &Path,
+) -> Option<ConflictKind> {
+    if counts.get(&target_key(target)).copied().unwrap_or(0) > 1 {
+        Some(ConflictKind::Duplicate)
+    } else if target != src
+        && *exists_cache
+            .entry(target.to_path_buf())
+            .or_insert_with(|| target.exists())
+    {
+        Some(ConflictKind::TargetExists)
+    } else {
+        None
+    }
+}
+
+/// Whether a row's episode is missing from the matched work's
+/// episode listing for its season (the catalogue has no such
+/// episode). Mirrors the rule `refresh_previews` always used.
+fn episode_missing(row: &Row, work: &Work) -> bool {
+    if row.done {
+        return false;
+    }
+    let (Some(cand), Some(season), Some(episode)) = (
+        work.matched(),
+        row.parsed.season,
+        row.parsed.episode,
+    ) else {
+        return false;
+    };
+    if cand.media_type != MediaType::Tv || work.episodes_for != Some(cand.id) {
+        return false;
+    }
+    match work.episodes.get(&season) {
+        Some(eps) => {
+            let last = row.parsed.episode_end.unwrap_or(episode);
+            !eps.iter().any(|e| e.number >= episode && e.number <= last)
+        }
+        None => false,
+    }
 }
 
 /// Where one of a row's subtitles lands: next to the renamed
@@ -1433,17 +1695,139 @@ fn move_file(src: &Path, dst: &Path, lang: Lang) -> Result<(), String> {
 }
 
 /// Open a URL in the user's default browser (Help menu's
-/// homepage link). Only the macOS native menu calls this today.
-#[cfg(target_os = "macos")]
+/// homepage link).
 fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn();
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+
+/// Whether Windows is in dark mode for apps (AppsUseLightTheme = 0).
+#[cfg(target_os = "windows")]
+fn windows_system_dark() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            pdw_type: *mut u32,
+            pv_data: *mut std::ffi::c_void,
+            pcb_data: *mut u32,
+        ) -> i32;
+    }
+    let sub_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = "AppsUseLightTheme"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut data: u32 = 1;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            -2147483647, // HKEY_CURRENT_USER
+            sub_key.as_ptr(),
+            value_name.as_ptr(),
+            0x0000_0018, // RRF_RT_REG_DWORD
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut std::ffi::c_void,
+            &mut size,
+        )
+    };
+    status == 0 && data == 0
+}
+
+/// Opt the process into the Windows app mode matching the system
+/// theme (uxtheme's SetPreferredAppMode, ordinal 135), so the
+/// native menu bar and popup menus render dark under Windows dark
+/// mode instead of staying light. Must run before any menu exists.
+#[cfg(target_os = "windows")]
+fn windows_apply_app_mode() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(file_name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, proc_name: *const u8) -> usize;
+    }
+    unsafe {
+        let name: Vec<u16> = "uxtheme.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let module = LoadLibraryW(name.as_ptr());
+        if module == 0 {
+            return;
+        }
+        // Ordinal 135: SetPreferredAppMode(0=Default, 1=AllowDark).
+        let addr = GetProcAddress(module, 135usize as *const u8);
+        if addr != 0 {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 =
+                std::mem::transmute(addr);
+            let _ = set_mode(if windows_system_dark() { 1 } else { 0 });
+        }
+        // Ordinal 136: FlushMenuThemes().
+        let addr = GetProcAddress(module, 136usize as *const u8);
+        if addr != 0 {
+            let flush: unsafe extern "system" fn() = std::mem::transmute(addr);
+            flush();
+        }
+    }
+}
+
+/// Match the title bar to the app mode: dark under Windows dark
+/// mode, light otherwise (DWMWA_USE_IMMERSIVE_DARK_MODE).
+#[cfg(target_os = "windows")]
+fn windows_set_dark_titlebar(hwnd: isize) {
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attr: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let value: i32 = if windows_system_dark() { 1 } else { 0 };
+    unsafe {
+        // Attribute 20 on current Windows, 19 on older builds.
+        if DwmSetWindowAttribute(
+            hwnd,
+            20,
+            &value as *const i32 as *const std::ffi::c_void,
+            4,
+        ) != 0
+        {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                19,
+                &value as *const i32 as *const std::ffi::c_void,
+                4,
+            );
+        }
+    }
+}
+
+/// The native window handle, for attaching the system menu on Windows.
+#[cfg(target_os = "windows")]
+fn window_hwnd(frame: &eframe::Frame) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match frame.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
 }
 
 /// Human-readable byte count for the progress modal
@@ -1549,6 +1933,8 @@ struct VideoTagApp {
     wants_quit: bool,
     #[cfg(target_os = "macos")]
     native_menu: Option<NativeMenu>,
+    #[cfg(target_os = "windows")]
+    titlebar_done: bool,
     settings: Settings,
     roots: Vec<PathBuf>,
     works: Vec<Work>,
@@ -1577,15 +1963,55 @@ struct VideoTagApp {
     batch_running: bool,
     batch_cancel: Arc<AtomicBool>,
     batch_progress: (usize, usize),
+    /// File-level batch counts (the status line reports files,
+    /// not works: one work can hold hundreds of episodes, and a
+    /// "matched 1" for a whole season read as a bug).
+    /// `batch_work_rows` maps each job's work to its row count.
+    batch_work_rows: HashMap<usize, usize>,
+    batch_files_total: usize,
+    batch_files_done: usize,
+    batch_files_failed: usize,
     /// Works skipped by the current/last batch because their
     /// titles cannot be searched (reported separately, never as
     /// failures).
     batch_unrecognized: usize,
+    /// Match results stashed by the running batch, applied
+    /// afterwards by the apply pass (see `PendingResult`).
+    pending_results: Vec<PendingResult>,
+    /// The post-match apply pass, while it runs.
+    apply: Option<ApplyState>,
+    /// Current phase line for the match progress modal (what
+    /// the matcher is doing inside the current work).
+    match_phase: String,
     enrich_rx: Option<Receiver<EnrichDone>>,
     probe_rx: Option<Receiver<ProbeEvent>>,
     /// Files waiting for a media-probe slot (one batch runs at a
     /// time; see `maybe_start_probe`).
     probe_pending: Vec<PathBuf>,
+    /// Path → row index for probe results, rebuilt only when
+    /// the row set changes (`row_index_dirty`): a fresh build
+    /// per poll on a big library was its own freeze source.
+    row_index: HashMap<PathBuf, usize>,
+    row_index_dirty: bool,
+    scan_rx: Option<Receiver<ScanEvent>>,
+    /// Roots waiting for their background scan (one runs at a
+    /// time; see `maybe_start_scan`). Scanning used to run on
+    /// the UI thread, which froze the window on big libraries.
+    scan_pending: Vec<PathBuf>,
+    /// The root the running scan is working on (duplicate check
+    /// and status line).
+    scan_current: Option<PathBuf>,
+    /// Set by `clear_list` so a scan that finishes afterwards
+    /// drops its results instead of repopulating the list.
+    scan_cancel: Arc<AtomicBool>,
+    /// Filesystem existence results for preview targets, cached
+    /// across preview refreshes (see `conflicting_kinds`).
+    target_exists_cache: HashMap<PathBuf, bool>,
+    /// How many rows aim at each preview target (lowercased
+    /// path key): the duplicate-conflict counts, rebuilt by
+    /// `refresh_previews` and kept in sync by
+    /// `refresh_work_previews`.
+    target_counts: HashMap<String, usize>,
     exec_rx: Option<Receiver<ExecEvent>>,
     exec_running: bool,
     exec_progress: (usize, usize),
@@ -1615,6 +2041,8 @@ impl Default for VideoTagApp {
             wants_quit: false,
             #[cfg(target_os = "macos")]
             native_menu: None,
+            #[cfg(target_os = "windows")]
+            titlebar_done: false,
             settings: load_settings(),
             roots: Vec::new(),
             works: Vec::new(),
@@ -1633,10 +2061,25 @@ impl Default for VideoTagApp {
             batch_running: false,
             batch_cancel: Arc::new(AtomicBool::new(false)),
             batch_progress: (0, 0),
+            batch_work_rows: HashMap::new(),
+            batch_files_total: 0,
+            batch_files_done: 0,
+            batch_files_failed: 0,
             batch_unrecognized: 0,
+            pending_results: Vec::new(),
+            apply: None,
+            match_phase: String::new(),
             enrich_rx: None,
             probe_rx: None,
             probe_pending: Vec::new(),
+            row_index: HashMap::new(),
+            row_index_dirty: true,
+            scan_rx: None,
+            scan_pending: Vec::new(),
+            scan_current: None,
+            scan_cancel: Arc::new(AtomicBool::new(false)),
+            target_exists_cache: HashMap::new(),
+            target_counts: HashMap::new(),
             exec_rx: None,
             exec_running: false,
             exec_progress: (0, 0),
@@ -1652,12 +2095,89 @@ impl Default for VideoTagApp {
 }
 
 impl VideoTagApp {
+    /// Queue a library root for scanning. The scan itself runs
+    /// on a background thread (`maybe_start_scan` / `poll_scan`)
+    /// — it used to run inline here, and walking + parsing a
+    /// large library on the UI thread froze the window (Windows
+    /// flagged it "not responding", and a junction cycle in the
+    /// tree could overflow the stack and crash outright).
     fn add_root(&mut self, root: PathBuf) {
-        if self.roots.contains(&root) {
+        if self.roots.contains(&root)
+            || self.scan_pending.contains(&root)
+            || self.scan_current.as_ref() == Some(&root)
+        {
             self.status = t(self.lang, "这个目录已经添加过了。", "That folder is already added.").to_string();
             return;
         }
-        let (new_works, mut new_rows) = scan_root(&root);
+        self.scan_pending.push(root);
+        self.maybe_start_scan();
+    }
+
+    /// Start scanning the next queued root, if none is running.
+    fn maybe_start_scan(&mut self) {
+        if self.scan_rx.is_some() || self.scan_pending.is_empty() {
+            return;
+        }
+        let root = self.scan_pending.remove(0);
+        self.scan_cancel.store(false, Ordering::Relaxed);
+        let cancel = self.scan_cancel.clone();
+        let (tx, rx) = channel();
+        self.scan_rx = Some(rx);
+        self.status = format!(
+            "{} {}…",
+            t(self.lang, "正在扫描", "Scanning"),
+            root.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned())
+        );
+        self.scan_current = Some(root.clone());
+        std::thread::spawn(move || {
+            let (works, rows) = scan_root(&root);
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(ScanEvent::Done { root, works, rows });
+            }
+        });
+    }
+
+    /// Collect a finished background scan, merge it into the
+    /// list, and kick off the next queued root.
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        let mut event: Option<ScanEvent> = None;
+        let mut disconnected = false;
+        if let Some(rx) = &self.scan_rx {
+            match rx.try_recv() {
+                Ok(ev) => event = Some(ev),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                }
+            }
+        }
+        if disconnected {
+            self.scan_rx = None;
+            self.scan_current = None;
+        }
+        if let Some(ScanEvent::Done { root, works, rows }) = event {
+            self.scan_rx = None;
+            self.scan_current = None;
+            self.apply_scanned_root(root, works, rows);
+        }
+        if self.scan_rx.is_none() {
+            self.maybe_start_scan();
+        }
+        if self.scan_rx.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Merge one root's scan results into the list (the part of
+    /// the old `add_root` that ran after `scan_root` returned).
+    fn apply_scanned_root(
+        &mut self,
+        root: PathBuf,
+        new_works: Vec<Work>,
+        mut new_rows: Vec<Row>,
+    ) {
         if new_rows.is_empty() {
             self.status = t(
                 self.lang,
@@ -1684,6 +2204,7 @@ impl VideoTagApp {
         self.roots.push(root);
         self.works.extend(new_works);
         self.rows.extend(new_rows);
+        self.row_index_dirty = true;
         self.status = format!(
             "{} {count} {}",
             t(self.lang, "已添加", "Added"),
@@ -1751,21 +2272,43 @@ impl VideoTagApp {
         if disconnected {
             self.probe_rx = None;
         }
-        let mut dirty = false;
-        for ev in events {
-            let ProbeEvent::Done { path, tags } = ev;
-            if tags.is_empty() {
-                continue; // probe failed / no ffmpeg: keep the fallback
+        let mut touched: HashSet<usize> = HashSet::new();
+        if !events.is_empty() {
+            // Path → row index, rebuilt only when the row set
+            // changed: a fresh build per poll on a big library
+            // was its own freeze source.
+            if self.row_index_dirty {
+                self.row_index = self
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (r.path.clone(), i))
+                    .collect();
+                self.row_index_dirty = false;
             }
-            if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
-                if row.media_tags.as_deref() != Some(tags.as_slice()) {
-                    row.media_tags = Some(tags);
-                    dirty = true;
+            for ev in events {
+                let ProbeEvent::Done { path, tags } = ev;
+                if tags.is_empty() {
+                    continue; // probe failed / no ffmpeg: keep the fallback
+                }
+                if let Some(&i) = self.row_index.get(&path) {
+                    let row = &mut self.rows[i];
+                    if row.media_tags.as_deref() != Some(tags.as_slice()) {
+                        row.media_tags = Some(tags);
+                        touched.insert(row.work);
+                    }
                 }
             }
         }
-        if dirty {
+        // Refresh only the works whose files actually gained
+        // tags: a full preview rebuild per poll is what made
+        // the window feel frozen while probes streamed in.
+        if touched.len() > 8 {
             self.refresh_previews();
+        } else {
+            for w in touched {
+                self.refresh_work_previews(w);
+            }
         }
         if self.probe_rx.is_none() {
             self.maybe_start_probe();
@@ -1787,6 +2330,14 @@ impl VideoTagApp {
         self.selected = None;
         self.picker = None;
         self.probe_pending.clear();
+        // A scan still running for the cleared list drops its
+        // results (cancel flag), and queued roots never start.
+        self.scan_pending.clear();
+        self.scan_cancel.store(true, Ordering::Relaxed);
+        self.scan_rx = None;
+        self.scan_current = None;
+        self.target_exists_cache.clear();
+        self.row_index_dirty = true;
         self.conflict_count = 0;
         self.batch_unrecognized = 0;
     }
@@ -1808,7 +2359,11 @@ impl VideoTagApp {
     /// A background batch (matching or executing) is running:
     /// actions that would move, remove or re-match rows wait.
     fn busy(&self) -> bool {
-        self.batch_running || self.exec_running
+        self.batch_running
+            || self.apply.is_some()
+            || self.exec_running
+            || self.scan_rx.is_some()
+            || !self.scan_pending.is_empty()
     }
 
     /// Execute the checked, previewed, conflict-free rows: move
@@ -2115,6 +2670,81 @@ impl VideoTagApp {
         });
     }
 
+    /// Modal progress window shown while a match batch runs
+    /// (the v0.1.7 design, replacing the live waterfall): the
+    /// list behind it is not touched at all until the batch
+    /// finishes, so during matching the UI thread does nothing
+    /// but spin this dialog — no per-result preview refreshes,
+    /// no filesystem stats — and the app stays responsive on
+    /// big libraries and slow shares. When the batch ends the
+    /// modal closes and the apply pass fills the list in (see
+    /// `ApplyState`). The Stop button cancels the batch;
+    /// results already in are still applied.
+    fn match_progress_modal(&self, ctx: &egui::Context) {
+        let lang = self.lang;
+        let files_done = self.batch_files_done + self.batch_files_failed;
+        let files_total = self.batch_files_total;
+        let frac = if files_total > 0 {
+            files_done as f32 / files_total as f32
+        } else {
+            0.0
+        };
+        let cancel = self.batch_cancel.clone();
+        egui::Modal::new(egui::Id::new("match_progress")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(20, 18))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "{} {}…",
+                            t(lang, "正在在线匹配", "Matching online"),
+                            platform_label(self.last_platform)
+                        ));
+                    });
+                    ui.add_space(14.0);
+                    progress_bar_ink(
+                        ui,
+                        frac,
+                        &format!(
+                            "{} {files_done} / {files_total}",
+                            t(lang, "文件", "Files")
+                        ),
+                    );
+                    ui.add_space(12.0);
+                    if self.match_phase.is_empty() {
+                        ui.label(" ");
+                    } else {
+                        ui.add(
+                            egui::Label::new(self.match_phase.as_str()).truncate(),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} {} · {} {}",
+                            t(lang, "成功", "Matched"),
+                            self.batch_files_done,
+                            t(lang, "失败", "failed"),
+                            self.batch_files_failed
+                        ));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .button(t(lang, "停止", "Stop"))
+                                    .clicked()
+                                {
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                            },
+                        );
+                    });
+                });
+        });
+    }
+
     /// Shared tidy-up after rows leave the list (manual removal,
     /// the post-save clear): drop the picker and selection, remap
     /// work indices to the surviving works, and forget roots
@@ -2148,6 +2778,7 @@ impl VideoTagApp {
     fn remove_checked(&mut self) {
         let before = self.rows.len();
         self.rows.retain(|r| !r.checked);
+        self.row_index_dirty = true;
         let removed = before - self.rows.len();
         if removed == 0 {
             return;
@@ -2199,8 +2830,16 @@ impl VideoTagApp {
         }
         let mut jobs: Vec<WorkJob> = Vec::new();
         let mut unrecognized = 0usize;
+        // One pass to find the works with checked rows (the
+        // per-work row scan this replaces was O(works × rows)).
+        let checked_works: HashSet<usize> = self
+            .rows
+            .iter()
+            .filter(|r| r.checked)
+            .map(|r| r.work)
+            .collect();
         for (idx, work) in self.works.iter().enumerate() {
-            if !self.rows.iter().any(|r| r.work == idx && r.checked) {
+            if !checked_works.contains(&idx) {
                 continue;
             }
             let pinned_id = work.parsed.id_for(platform);
@@ -2252,9 +2891,23 @@ impl VideoTagApp {
                 w.failed = false;
             }
         }
+        // File-level accounting for the batch (see the field
+        // docs): rows per job work, counted in one pass.
+        self.batch_work_rows.clear();
+        for row in &self.rows {
+            *self.batch_work_rows.entry(row.work).or_default() += 1;
+        }
+        self.batch_files_total = jobs
+            .iter()
+            .map(|j| self.batch_work_rows.get(&j.work).copied().unwrap_or(0))
+            .sum();
+        self.batch_files_done = 0;
+        self.batch_files_failed = 0;
         let (tx, rx) = channel();
         self.batch_rx = Some(rx);
         self.batch_running = true;
+        self.pending_results.clear();
+        self.match_phase = String::new();
         self.batch_progress = (0, total);
         self.batch_cancel.store(false, Ordering::Relaxed);
         let cancel = self.batch_cancel.clone();
@@ -2266,7 +2919,42 @@ impl VideoTagApp {
                     break;
                 }
                 let _ = tx.send(MatchEvent::WorkSearching { work: job.work });
-                match match_one(&cfg, platform, job) {
+                // Live phases from inside this work's match, so
+                // the status line keeps moving while a single
+                // big show is fetched.
+                let report = |phase: PhaseMsg| {
+                    let _ = tx.send(MatchEvent::WorkProgress {
+                        work: job.work,
+                        phase,
+                    });
+                };
+                // The pick and the episode chunks are reported
+                // as they land, but only as progress: the UI
+                // keeps the list untouched behind the modal and
+                // applies each work's complete result from
+                // WorkDone after the batch (see ApplyState).
+                let found =
+                    |cands: &[Candidate], chosen: usize, detail: &Option<Candidate>| {
+                        let _ = tx.send(MatchEvent::WorkFound {
+                            work: job.work,
+                            candidates: cands.to_vec(),
+                            chosen,
+                            detail: detail.clone(),
+                        });
+                    };
+                let sink = |chunk: Vec<(u32, Vec<Episode>)>| {
+                    let chunk: Vec<(u32, Vec<Episode>)> = chunk
+                        .into_iter()
+                        .filter(|(season, _)| job.seasons.contains(season))
+                        .collect();
+                    if !chunk.is_empty() {
+                        let _ = tx.send(MatchEvent::WorkEpisodes {
+                            work: job.work,
+                            episodes: chunk,
+                        });
+                    }
+                };
+                match match_one(&cfg, platform, job, &report, &found, &sink) {
                     Some((candidates, chosen, detail, episodes)) => {
                         matched += 1;
                         let _ = tx.send(MatchEvent::WorkDone {
@@ -2375,13 +3063,68 @@ impl VideoTagApp {
                 events.push(ev);
             }
         }
-        let mut dirty = false;
         for ev in events {
             match ev {
                 MatchEvent::WorkSearching { work } => {
                     if let Some(w) = self.works.get_mut(work) {
                         w.searching = true;
                     }
+                }
+                MatchEvent::WorkProgress { work, phase } => {
+                    let phase_text = match &phase {
+                        PhaseMsg::Searching => format!(
+                            "{}《{}》",
+                            t(self.lang, "正在搜索", "Searching"),
+                            self.works
+                                .get(work)
+                                .map(|w| w.parsed.title.clone())
+                                .unwrap_or_default()
+                        ),
+                        PhaseMsg::Found(title) => format!(
+                            "{}《{}》{}",
+                            t(self.lang, "已找到", "Found"),
+                            title,
+                            t(
+                                self.lang,
+                                "，正在获取详情与剧集",
+                                ", fetching details and episodes"
+                            )
+                        ),
+                        PhaseMsg::Episodes(done, total) => {
+                            if *total <= 1 {
+                                t(self.lang, "正在获取全部剧集", "Fetching the full episode list")
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "{} {}/{} {}",
+                                    t(self.lang, "正在获取剧集", "Fetching episodes"),
+                                    done,
+                                    total,
+                                    t(self.lang, "季", "seasons")
+                                )
+                            }
+                        }
+                    };
+                    self.match_phase = phase_text;
+                    self.status = format!(
+                        "{} {}/{} · {}",
+                        t(self.lang, "在线匹配中…", "Matching…"),
+                        self.batch_files_done + self.batch_files_failed,
+                        self.batch_files_total,
+                        self.match_phase
+                    );
+                }
+                MatchEvent::WorkFound { .. }
+                | MatchEvent::WorkEpisodes { .. } => {
+                    // Progress only, deliberately not applied:
+                    // while the batch runs, the list stays
+                    // untouched behind the progress modal (the
+                    // per-result preview refreshes of the old
+                    // waterfall design were the freeze — every
+                    // chunk rebuilt previews and statted targets
+                    // on the UI thread). The complete result
+                    // arrives with WorkDone and is stashed for
+                    // the post-match apply pass.
                 }
                 MatchEvent::WorkDone {
                     work,
@@ -2391,42 +3134,24 @@ impl VideoTagApp {
                     episodes,
                 } => {
                     self.batch_progress.0 += 1;
-                    if let Some(w) = self.works.get_mut(work) {
-                        let prev_source = w.matched().map(|c| c.source);
-                        w.searching = false;
-                        w.failed = false;
-                        w.candidates = candidates;
-                        w.chosen = Some(chosen);
-                        w.detail = detail;
-                        // A re-match on a different platform must
-                        // not inherit the old platform's episode
-                        // lists (ids collide across catalogues).
-                        if prev_source.is_some()
-                            && prev_source != w.matched().map(|c| c.source)
-                        {
-                            w.episodes.clear();
-                        }
-                        let canon = w.matched().map(|c| c.id);
-                        w.episodes_for = canon;
-                        for (season, eps) in episodes {
-                            w.episodes.insert(season, eps);
-                        }
-                    }
-                    dirty = true;
-                    self.status = format!(
-                        "{} {}/{}",
-                        t(self.lang, "在线匹配中…", "Matching…"),
-                        self.batch_progress.0,
-                        self.batch_progress.1
-                    );
+                    self.batch_files_done +=
+                        self.batch_work_rows.get(&work).copied().unwrap_or(0);
+                    // Stash only — no work mutation, no preview
+                    // refresh. The apply pass writes it into the
+                    // list after the batch finishes.
+                    self.pending_results.push(PendingResult::Done {
+                        work,
+                        candidates,
+                        chosen,
+                        detail,
+                        episodes,
+                    });
                 }
                 MatchEvent::WorkFailed { work } => {
                     self.batch_progress.0 += 1;
-                    if let Some(w) = self.works.get_mut(work) {
-                        w.searching = false;
-                        w.failed = true;
-                    }
-                    dirty = true;
+                    self.batch_files_failed +=
+                        self.batch_work_rows.get(&work).copied().unwrap_or(0);
+                    self.pending_results.push(PendingResult::Failed { work });
                 }
                 MatchEvent::Finished { matched, failed } => {
                     self.batch_running = false;
@@ -2434,13 +3159,22 @@ impl VideoTagApp {
                     for w in self.works.iter_mut() {
                         w.searching = false;
                     }
-                    let mut status = format!(
-                        "{} {}，{} {}",
-                        t(self.lang, "匹配完成：成功", "Done: matched"),
-                        matched,
-                        t(self.lang, "失败", "failed"),
-                        failed
-                    );
+                    let mut status = match self.lang {
+                        Lang::Zh => format!(
+                            "匹配完成：成功 {} 个文件（{} 个作品），失败 {} 个文件（{} 个作品）",
+                            self.batch_files_done,
+                            matched,
+                            self.batch_files_failed,
+                            failed
+                        ),
+                        Lang::En => format!(
+                            "Done: matched {} files ({} works), failed {} files ({} works)",
+                            self.batch_files_done,
+                            matched,
+                            self.batch_files_failed,
+                            failed
+                        ),
+                    };
                     if self.batch_unrecognized > 0 {
                         status.push_str(&match self.lang {
                             Lang::Zh => format!("，无法识别 {}", self.batch_unrecognized),
@@ -2449,14 +3183,190 @@ impl VideoTagApp {
                             }
                         });
                     }
-                    self.status = status;
+                    // The batch is over: the progress modal
+                    // closes (batch_running is false) and the
+                    // apply pass writes the stashed results
+                    // into the list slice by slice; it shows
+                    // this summary when it completes.
+                    let queue: VecDeque<PendingResult> =
+                        self.pending_results.drain(..).collect();
+                    let works_total = queue.len();
+                    self.apply = Some(ApplyState {
+                        queue,
+                        current: None,
+                        final_status: status,
+                        works_total,
+                        works_done: 0,
+                    });
                 }
             }
         }
-        if dirty {
-            self.refresh_previews();
-        }
         if self.batch_running {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Drive the post-match apply pass (see `ApplyState`):
+    /// each frame works under a small time budget, then asks
+    /// for a repaint, so the list fills in work by work, row
+    /// by row, and no single frame does a whole library's
+    /// worth of preview building and target stats.
+    fn poll_apply(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.apply.take() else {
+            return;
+        };
+        let start = Instant::now();
+        let budget = Duration::from_millis(8);
+        let mut drained = false;
+        'frame: loop {
+            // Start the next stashed result when none is
+            // mid-application.
+            if state.current.is_none() {
+                match state.queue.pop_front() {
+                    None => {
+                        drained = true;
+                        break 'frame;
+                    }
+                    Some(PendingResult::Failed { work }) => {
+                        if let Some(w) = self.works.get_mut(work) {
+                            w.searching = false;
+                            w.failed = true;
+                        }
+                        state.works_done += 1;
+                        if start.elapsed() >= budget {
+                            break 'frame;
+                        }
+                        continue 'frame;
+                    }
+                    Some(PendingResult::Done {
+                        work,
+                        candidates,
+                        chosen,
+                        detail,
+                        episodes,
+                    }) => {
+                        if let Some(w) = self.works.get_mut(work) {
+                            let prev_source = w.matched().map(|c| c.source);
+                            w.searching = false;
+                            w.failed = false;
+                            w.candidates = candidates;
+                            w.chosen = Some(chosen);
+                            w.detail = detail;
+                            // A re-match on a different platform
+                            // must not inherit the old platform's
+                            // episode lists (ids collide across
+                            // catalogues).
+                            if prev_source.is_some()
+                                && prev_source != w.matched().map(|c| c.source)
+                            {
+                                w.episodes.clear();
+                            }
+                            let canon = w.matched().map(|c| c.id);
+                            w.episodes_for = canon;
+                            for (season, eps) in episodes {
+                                w.episodes.insert(season, eps);
+                            }
+                        }
+                        let row_ids: Vec<usize> = self
+                            .rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, r)| r.work == work)
+                            .map(|(i, _)| i)
+                            .collect();
+                        state.current = Some(ApplyWork {
+                            work,
+                            row_ids,
+                            affected: HashSet::new(),
+                            recount: HashMap::new(),
+                            phase: ApplyPhase::Rebuild,
+                            cursor: 0,
+                        });
+                    }
+                }
+            }
+            // Advance the current work until its three passes
+            // complete or the frame's budget runs out.
+            loop {
+                let Some(cur) = state.current.as_mut() else {
+                    break;
+                };
+                let work_complete = match cur.phase {
+                    ApplyPhase::Rebuild => {
+                        if cur.cursor < cur.row_ids.len() {
+                            let i = cur.row_ids[cur.cursor];
+                            cur.cursor += 1;
+                            self.rebuild_row_preview(i, &mut cur.affected);
+                            false
+                        } else if cur.affected.is_empty() {
+                            // No targets at all: the recount and
+                            // reflag passes would find nothing
+                            // (refresh_work_previews returns early
+                            // the same way).
+                            true
+                        } else {
+                            cur.phase = ApplyPhase::Recount;
+                            cur.cursor = 0;
+                            false
+                        }
+                    }
+                    ApplyPhase::Recount => {
+                        if cur.cursor < self.rows.len() {
+                            let i = cur.cursor;
+                            cur.cursor += 1;
+                            self.recount_row(i, &cur.affected, &mut cur.recount);
+                            false
+                        } else {
+                            self.sync_target_counts(&cur.affected, &cur.recount);
+                            cur.phase = ApplyPhase::Reflag;
+                            cur.cursor = 0;
+                            false
+                        }
+                    }
+                    ApplyPhase::Reflag => {
+                        if cur.cursor < self.rows.len() {
+                            let i = cur.cursor;
+                            let work = cur.work;
+                            cur.cursor += 1;
+                            self.reflag_row(i, work, &cur.affected);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                };
+                if work_complete {
+                    state.current = None;
+                    state.works_done += 1;
+                    break;
+                }
+                if start.elapsed() >= budget {
+                    break 'frame;
+                }
+            }
+            if start.elapsed() >= budget {
+                break 'frame;
+            }
+        }
+        if drained {
+            // One full refresh settles any cross-work duplicate
+            // flags the per-work passes could not see (same as
+            // the old end-of-batch refresh; the existence cache
+            // is warm by now, so it is a single light pass).
+            self.refresh_previews();
+            self.status = state.final_status;
+        } else {
+            self.status = match self.lang {
+                Lang::Zh => format!(
+                    "正在更新列表… {}/{} 个作品",
+                    state.works_done, state.works_total
+                ),
+                Lang::En => format!(
+                    "Updating the list… {}/{} works",
+                    state.works_done, state.works_total
+                ),
+            };
+            self.apply = Some(state);
             ctx.request_repaint();
         }
     }
@@ -2484,7 +3394,8 @@ impl VideoTagApp {
             let detail = fetch_detail(&cfg, &cand);
             throttle();
             let canonical = detail.clone().unwrap_or_else(|| cand.clone());
-            let episodes = fetch_episodes_for(&cfg, &canonical, &seasons);
+            let episodes =
+                fetch_episodes_for(&cfg, &canonical, &seasons, &|_| {}, &|_| {});
             let _ = tx.send(EnrichDone {
                 work: work_idx,
                 cand_id: cand.id,
@@ -2508,7 +3419,6 @@ impl VideoTagApp {
             return;
         }
         self.enrich_rx = None;
-        let mut dirty = false;
         for ev in done {
             let still_chosen = self
                 .works
@@ -2529,10 +3439,7 @@ impl VideoTagApp {
                     w.episodes.insert(season, eps);
                 }
             }
-            dirty = true;
-        }
-        if dirty {
-            self.refresh_previews();
+            self.refresh_work_previews(ev.work);
         }
     }
 
@@ -2553,7 +3460,7 @@ impl VideoTagApp {
             w.episodes_for = None;
         }
         self.start_enrich(work_idx);
-        self.refresh_previews();
+        self.refresh_work_previews(work_idx);
     }
 }
 
@@ -2648,6 +3555,17 @@ fn build_preview(row: &Row, work: &Work, settings: &Settings, lang: Lang) -> Opt
     let ext = ext_of(&row.path);
     match (row.parsed.season, row.parsed.episode) {
         (Some(season), Some(episode)) => {
+            // While this work's episode lists are still
+            // streaming in, a season that has not arrived yet
+            // yields no preview: the builder would fill a
+            // placeholder title, and the row should keep
+            // showing "matching…" until its real name lands.
+            if work.searching
+                && work.episodes_for == Some(cand.id)
+                && !work.episodes.contains_key(&season)
+            {
+                return None;
+            }
             // The episode title (and its air date) is a fixed
             // part of the file-name format: whatever TMDB's
             // episode listing holds for this episode goes in,
@@ -2691,68 +3609,169 @@ impl VideoTagApp {
     /// conflict flag. Called whenever matches, selections, rows or
     /// settings change — not per frame (it stats the filesystem).
     fn refresh_previews(&mut self) {
-        let mut previews: Vec<Option<String>> = Vec::with_capacity(self.rows.len());
-        let mut targets: Vec<Option<PathBuf>> = Vec::with_capacity(self.rows.len());
-        for row in &self.rows {
-            let work = &self.works[row.work];
-            let preview = build_preview(row, work, &self.settings, self.lang);
-            let target = preview
-                .as_deref()
-                .map(|p| target_for_preview(&row.root, p, &self.settings));
-            previews.push(preview);
-            targets.push(target);
+        for i in 0..self.rows.len() {
+            let preview = build_preview(
+                &self.rows[i],
+                &self.works[self.rows[i].work],
+                &self.settings,
+                self.lang,
+            );
+            self.rows[i].preview = preview;
         }
         // Conflicts are judged on the absolute targets: with an
         // output folder set, rows from different roots can aim
-        // at the very same file.
-        let mut pair_rows: Vec<usize> = Vec::new();
-        let mut pair_src: Vec<PathBuf> = Vec::new();
-        let mut pair_tgt: Vec<PathBuf> = Vec::new();
-        for (i, row) in self.rows.iter().enumerate() {
-            if let Some(target) = &targets[i] {
-                pair_rows.push(i);
-                pair_src.push(row.path.clone());
-                pair_tgt.push(target.clone());
+        // at the very same file. The counts are rebuilt
+        // wholesale here; `refresh_work_previews` keeps them in
+        // sync incrementally between full refreshes.
+        self.target_counts.clear();
+        for row in &self.rows {
+            if let Some(target) = row_target(row, &self.settings) {
+                *self.target_counts.entry(target_key(&target)).or_default() += 1;
             }
-        }
-        let kinds = conflicting_kinds(&pair_src, &pair_tgt);
-        let mut conflict_of: HashMap<usize, Option<ConflictKind>> = HashMap::new();
-        for (k, i) in pair_rows.iter().enumerate() {
-            conflict_of.insert(*i, kinds[k]);
         }
         let mut conflict_count = 0;
-        for (i, row) in self.rows.iter_mut().enumerate() {
-            let preview = previews[i].take();
-            let kind = conflict_of.get(&i).copied().unwrap_or(None);
-            let conflict = kind.is_some();
-            if conflict {
+        for i in 0..self.rows.len() {
+            let kind = match row_target(&self.rows[i], &self.settings) {
+                Some(target) => kind_for(
+                    &self.target_counts,
+                    &mut self.target_exists_cache,
+                    &self.rows[i].path,
+                    &target,
+                ),
+                None => None,
+            };
+            self.rows[i].conflict = kind.is_some();
+            self.rows[i].conflict_kind = kind;
+            if kind.is_some() {
                 conflict_count += 1;
             }
-            row.preview = preview;
-            row.conflict = conflict;
-            row.conflict_kind = kind;
-            // Episode missing from TMDB's listing for this season.
-            row.ep_missing = false;
-            if row.done {
-                continue;
+            self.rows[i].ep_missing =
+                episode_missing(&self.rows[i], &self.works[self.rows[i].work]);
+        }
+        self.conflict_count = conflict_count;
+    }
+
+    /// Pass 1 of a scoped refresh, for one row: rebuild its
+    /// preview, collecting the old and new targets into
+    /// `affected`.
+    fn rebuild_row_preview(&mut self, i: usize, affected: &mut HashSet<PathBuf>) {
+        let work_idx = self.rows[i].work;
+        if let Some(old) = row_target(&self.rows[i], &self.settings) {
+            affected.insert(old);
+        }
+        let preview = build_preview(
+            &self.rows[i],
+            &self.works[work_idx],
+            &self.settings,
+            self.lang,
+        );
+        self.rows[i].preview = preview;
+        if let Some(new_target) = row_target(&self.rows[i], &self.settings) {
+            affected.insert(new_target);
+        }
+    }
+
+    /// Pass 2 of a scoped refresh, for one row: count it
+    /// towards its target when that target is affected.
+    fn recount_row(
+        &self,
+        i: usize,
+        affected: &HashSet<PathBuf>,
+        recount: &mut HashMap<String, usize>,
+    ) {
+        if let Some(target) = row_target(&self.rows[i], &self.settings) {
+            if affected.contains(&target) {
+                *recount.entry(target_key(&target)).or_default() += 1;
             }
-            let work = &self.works[row.work];
-            if let (Some(cand), Some(season), Some(episode)) = (
-                work.matched(),
-                row.parsed.season,
-                row.parsed.episode,
-            ) {
-                if cand.media_type == MediaType::Tv && work.episodes_for == Some(cand.id) {
-                    if let Some(eps) = work.episodes.get(&season) {
-                        let last = row.parsed.episode_end.unwrap_or(episode);
-                        if !eps.iter().any(|e| e.number >= episode && e.number <= last) {
-                            row.ep_missing = true;
-                        }
-                    }
+        }
+    }
+
+    /// Pass 2 of a scoped refresh, the sync: fold the
+    /// recounted tallies into the app-wide target counts.
+    fn sync_target_counts(
+        &mut self,
+        affected: &HashSet<PathBuf>,
+        recount: &HashMap<String, usize>,
+    ) {
+        for target in affected {
+            let key = target_key(target);
+            match recount.get(&key) {
+                Some(&n) => {
+                    self.target_counts.insert(key, n);
+                }
+                None => {
+                    self.target_counts.remove(&key);
                 }
             }
         }
-        self.conflict_count = conflict_count;
+    }
+
+    /// Pass 3 of a scoped refresh, for one row: re-judge its
+    /// conflict flag (and, for the refreshed work's own rows,
+    /// the episode-missing flag).
+    fn reflag_row(&mut self, i: usize, work_idx: usize, affected: &HashSet<PathBuf>) {
+        let target = row_target(&self.rows[i], &self.settings);
+        let mine = self.rows[i].work == work_idx;
+        let hit = target
+            .as_ref()
+            .map(|t| affected.contains(t))
+            .unwrap_or(false);
+        if !mine && !hit {
+            return;
+        }
+        let was = self.rows[i].conflict;
+        let kind = match &target {
+            Some(t) => kind_for(
+                &self.target_counts,
+                &mut self.target_exists_cache,
+                &self.rows[i].path,
+                t,
+            ),
+            None => None,
+        };
+        self.rows[i].conflict = kind.is_some();
+        self.rows[i].conflict_kind = kind;
+        match (was, kind.is_some()) {
+            (false, true) => self.conflict_count += 1,
+            (true, false) => self.conflict_count -= 1,
+            _ => {}
+        }
+        if mine {
+            self.rows[i].ep_missing =
+                episode_missing(&self.rows[i], &self.works[work_idx]);
+        }
+    }
+
+    /// Scoped preview refresh for ONE work — the interactive
+    /// path (picker changes, enrich results), so the work's
+    /// rows show their new names and status immediately. The
+    /// batch matcher no longer calls this per result (that was
+    /// the freeze); its apply pass runs the same three passes
+    /// sliced across frames (see `poll_apply`). Only the
+    /// work's rows are rebuilt, plus the conflict flags of any
+    /// row aiming at an affected target.
+    fn refresh_work_previews(&mut self, work_idx: usize) {
+        let mut affected: HashSet<PathBuf> = HashSet::new();
+        for i in 0..self.rows.len() {
+            if self.rows[i].work == work_idx {
+                self.rebuild_row_preview(i, &mut affected);
+            }
+        }
+        if affected.is_empty() {
+            return;
+        }
+        // Recount the affected targets in one pass and sync the
+        // app-wide counts.
+        let mut recount: HashMap<String, usize> = HashMap::new();
+        for i in 0..self.rows.len() {
+            self.recount_row(i, &affected, &mut recount);
+        }
+        self.sync_target_counts(&affected, &recount);
+        // Re-flag the work's rows and any row aiming at an
+        // affected target.
+        for i in 0..self.rows.len() {
+            self.reflag_row(i, work_idx, &affected);
+        }
     }
 }
 
@@ -2762,10 +3781,15 @@ impl VideoTagApp {
 
 #[cfg(target_os = "macos")]
 struct NativeMenu {
+    // Read on Windows only (macOS attaches at build time).
+    #[allow(dead_code)]
+    attached: bool,
     _menu: muda::Menu,
     about: muda::MenuItem,
     settings_m: muda::MenuItem,
+    settings_file: muda::MenuItem,
     quit_app: muda::MenuItem,
+    quit_file: muda::MenuItem,
     add_dir: muda::MenuItem,
     save_m: muda::MenuItem,
     select_all_m: muda::MenuItem,
@@ -2779,12 +3803,16 @@ struct NativeMenu {
     github: muda::MenuItem,
 }
 
+/// The primary shortcut modifier: Command on macOS, Control on Windows.
+#[cfg(target_os = "macos")]
+const PRIMARY_MOD: muda::accelerator::Modifiers = muda::accelerator::Modifiers::META;
+
 #[cfg(target_os = "macos")]
 fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
     let accel = |code: muda::accelerator::Code| {
         Some(muda::accelerator::Accelerator::new(
-            Some(muda::accelerator::Modifiers::META),
+            Some(PRIMARY_MOD),
             code,
         ))
     };
@@ -2800,8 +3828,18 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     app_menu.append(&settings_m).ok()?;
     app_menu.append(&PredefinedMenuItem::separator()).ok()?;
     app_menu.append(&quit_app).ok()?;
+    // Windows has no app-name menu; the File menu carries
+    // Preferences and Quit there instead.
+    #[cfg(target_os = "macos")]
     menu.append(&app_menu).ok()?;
 
+    // Twins for the Windows File menu (an item lives in one menu).
+    let settings_file = MenuItem::new(t(lang, "系统偏好", "Preferences"), true, None);
+    let quit_file = MenuItem::new(
+        t(lang, "退出 VideoTag", "Quit VideoTag"),
+        true,
+        accel(muda::accelerator::Code::KeyQ),
+    );
     let file_menu = Submenu::new(t(lang, "文件", "File"), true);
     let add_dir = MenuItem::new(
         t(lang, "添加目录…", "Add Folder…"),
@@ -2816,6 +3854,13 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     file_menu.append(&add_dir).ok()?;
     file_menu.append(&PredefinedMenuItem::separator()).ok()?;
     file_menu.append(&save_m).ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        file_menu.append(&PredefinedMenuItem::separator()).ok()?;
+        file_menu.append(&settings_file).ok()?;
+        file_menu.append(&PredefinedMenuItem::separator()).ok()?;
+        file_menu.append(&quit_file).ok()?;
+    }
     menu.append(&file_menu).ok()?;
 
     // The Edit menu mirrors the toolbar one-to-one: selection
@@ -2845,10 +3890,8 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     edit_menu.append(&match_bangumi_m).ok()?;
     menu.append(&edit_menu).ok()?;
 
-    // Help menu: About moved here from the app menu, plus a
-    // link to the author's homepage. The
-    // GitHub entry is a placeholder — VideoTag has no repo
-    // yet; it gets a real URL (and handler) at open-source time.
+    // Help menu: About moved here from the app menu, plus links
+    // to the author's homepage and the GitHub repo.
     let help_menu = Submenu::new(t(lang, "帮助", "Help"), true);
     let homepage = MenuItem::new(t(lang, "作者主页", "Author's Homepage"), true, None);
     let github = MenuItem::new(t(lang, "在GitHub上查看", "View on GitHub"), true, None);
@@ -2857,12 +3900,16 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
     help_menu.append(&homepage).ok()?;
     help_menu.append(&github).ok()?;
     menu.append(&help_menu).ok()?;
+    #[cfg(target_os = "macos")]
     menu.init_for_nsapp();
     Some(NativeMenu {
+        attached: cfg!(target_os = "macos"),
         _menu: menu,
         about,
         settings_m,
+        settings_file,
         quit_app,
+        quit_file,
         add_dir,
         save_m,
         select_all_m,
@@ -2879,9 +3926,17 @@ fn build_native_menu(lang: Lang) -> Option<NativeMenu> {
 
 impl VideoTagApp {
     #[cfg(target_os = "macos")]
-    fn native_menu_update(&mut self) {
+    fn native_menu_update(&mut self, _hwnd: Option<isize>) {
         if self.native_menu.is_none() {
             self.native_menu = build_native_menu(self.lang);
+        }
+        // Windows: attach the menu to the app window (once).
+        #[cfg(target_os = "windows")]
+        if let (Some(menu), Some(hwnd)) = (&mut self.native_menu, _hwnd) {
+            if !menu.attached {
+                windows_set_dark_titlebar(hwnd);
+                menu.attached = unsafe { menu._menu.init_for_hwnd(hwnd) }.is_ok();
+            }
         }
         let ids = {
             let Some(menu) = &self.native_menu else { return };
@@ -2900,18 +3955,20 @@ impl VideoTagApp {
                 menu.match_bangumi_m.id().clone(),
                 menu.homepage.id().clone(),
                 menu.github.id().clone(),
+                menu.settings_file.id().clone(),
+                menu.quit_file.id().clone(),
             )
         };
         let (about_id, settings_id, quit_id, add_id, save_id, select_all_id, invert_id,
-            remove_id, set_id_id, tmdb_id, tvdb_id, bangumi_id, homepage_id, github_id) =
+            remove_id, set_id_id, tmdb_id, tvdb_id, bangumi_id, homepage_id, github_id, settings_file_id, quit_file_id) =
             ids;
         while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
             let id = event.id();
             if id == &about_id {
                 self.show_about = true;
-            } else if id == &settings_id {
+            } else if id == &settings_id || id == &settings_file_id {
                 self.show_settings = true;
-            } else if id == &quit_id {
+            } else if id == &quit_id || id == &quit_file_id {
                 self.wants_quit = true;
             } else if id == &add_id {
                 if !self.busy() {
@@ -2961,8 +4018,7 @@ impl VideoTagApp {
             } else if id == &homepage_id {
                 open_url("https://mrben.net");
             } else if id == &github_id {
-                // Placeholder until the VideoTag repo exists:
-                // no destination yet.
+                open_url("https://github.com/i-love-osaka/VideoTag");
             }
         }
     }
@@ -3481,6 +4537,308 @@ fn parse_tmdb_id_input(text: &str) -> Option<u64> {
     parse_platform_id_input(text, IdPlatform::Tmdb)
 }
 
+
+/// One row in a drop-down menu: full width, label ink-left at a fixed
+/// inset (every row in every menu shares it, so labels line up),
+/// optional accelerator ink-right, hover highlight, optional check.
+#[cfg(not(target_os = "macos"))]
+fn menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    accel: Option<&str>,
+    checked: bool,
+    enabled: bool,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 30.0),
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let p = ui.painter();
+    if enabled && resp.hovered() {
+        p.rect_filled(rect, egui::CornerRadius::same(4), menu_hover_color(ui));
+    }
+    let font = egui::FontId::proportional(13.5);
+    let color = if enabled {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    if checked {
+        paint_text_ink_left(p, "\u{2713}", font.clone(), color, rect.left() + 4.0, rect.center().y);
+    }
+    paint_text_ink_left(p, label, font.clone(), color, rect.left() + 17.0, rect.center().y);
+    if let Some(a) = accel {
+        let accel_color = if enabled && resp.hovered() {
+            ui.visuals().text_color().gamma_multiply(0.8)
+        } else {
+            ui.visuals().weak_text_color()
+        };
+        paint_text_ink_right(
+            p,
+            a,
+            font,
+            accel_color,
+            rect.right() - 10.0,
+            rect.center().y,
+        );
+    }
+    enabled && resp.clicked()
+}
+
+
+/// The one hover color for menu bar items and drop-down rows
+/// alike, so both levels of menu highlight identically.
+#[cfg(not(target_os = "macos"))]
+fn menu_hover_color(ui: &egui::Ui) -> egui::Color32 {
+    // An opaque step from the menu's own background, so the
+    // highlight reads the same on every screen (an alpha wash
+    // photographed pale and washed the row text out).
+    let bg = ui.visuals().window_fill;
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(
+            bg.r().saturating_add(32),
+            bg.g().saturating_add(32),
+            bg.b().saturating_add(34),
+        )
+    } else {
+        egui::Color32::from_rgb(
+            bg.r().saturating_sub(16),
+            bg.g().saturating_sub(16),
+            bg.b().saturating_sub(16),
+        )
+    }
+}
+
+/// Separator line color (themed hairline).
+#[cfg(not(target_os = "macos"))]
+fn menu_sep_color(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_white_alpha(36)
+    } else {
+        egui::Color32::from_black_alpha(28)
+    }
+}
+
+/// Width that fits a menu's rows: the widest label + accelerator,
+/// plus the fixed insets the rows paint with.
+#[cfg(not(target_os = "macos"))]
+fn menu_width(ui: &egui::Ui, items: &[(&str, Option<&str>)]) -> f32 {
+    let font = egui::FontId::proportional(13.5);
+    let mut widest = 0.0f32;
+    for (label, accel) in items {
+        let mut w = ui
+            .fonts(|f| f.layout_no_wrap((*label).to_string(), font.clone(), egui::Color32::WHITE))
+            .size()
+            .x;
+        if let Some(a) = accel {
+            w += 28.0
+                + ui.fonts(|f| {
+                    f.layout_no_wrap((*a).to_string(), font.clone(), egui::Color32::WHITE)
+                })
+                .size()
+                .x;
+        }
+        widest = widest.max(w);
+    }
+    17.0 + widest + 12.0
+}
+
+/// A menu separator spanning the popup width.
+#[cfg(not(target_os = "macos"))]
+fn menu_sep(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 9.0),
+        egui::Sense::hover(),
+    );
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+        egui::Stroke::new(1.0_f32, menu_sep_color(ui)),
+    );
+}
+
+/// Flat styling for the menu bar: transparent until hovered/open,
+/// like a Windows system menu.
+#[cfg(not(target_os = "macos"))]
+fn style_menu_bar(ui: &mut egui::Ui) {
+    let hover = menu_hover_color(ui);
+    let style = ui.style_mut();
+    style.spacing.button_padding = egui::vec2(9.0, 3.0);
+    style.spacing.item_spacing.x = 4.0;
+    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.hovered.weak_bg_fill = hover;
+    style.visuals.widgets.hovered.bg_fill = hover;
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.open.weak_bg_fill = hover;
+    style.visuals.widgets.open.bg_fill = hover;
+    style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.active.weak_bg_fill = hover;
+    style.visuals.widgets.active.bg_fill = hover;
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+}
+
+impl VideoTagApp {
+    /// Set the Windows title-bar mode once the window exists.
+    #[cfg(target_os = "windows")]
+    fn apply_titlebar_once(&mut self, frame: &eframe::Frame) {
+        if !self.titlebar_done {
+            if let Some(hwnd) = window_hwnd(frame) {
+                windows_set_dark_titlebar(hwnd);
+                self.titlebar_done = true;
+            }
+        }
+    }
+
+    /// In-window menu bar for Windows/Linux, in the Windows system
+    /// style (see CleanTag for why it is drawn, not native).
+    /// macOS keeps the native menu.
+    #[cfg(not(target_os = "macos"))]
+    fn menu_bar(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|m| m.focused()).is_none() {
+            let (open, save, quit) = ctx.input(|i| {
+                (
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::O),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::S),
+                    i.modifiers.ctrl && i.key_pressed(egui::Key::Q),
+                )
+            });
+            if open && !self.busy() {
+                self.pick_root_dialog();
+            }
+            if save
+                && !self.busy()
+                && self.rows.iter().any(|r| r.checked && r.preview.is_some())
+            {
+                self.show_save_dialog = true;
+            }
+            if quit {
+                self.wants_quit = true;
+            }
+        }
+        let lang = self.lang;
+        egui::TopBottomPanel::top("menubar")
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(4, 4)),
+            )
+            .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                style_menu_bar(ui);
+                ui.menu_button(t(lang, "文件", "File"), |ui| {
+                    let w = menu_width(ui, &[
+                        (t(lang, "添加目录…", "Add Folder…"), Some("Ctrl+O")),
+                        (t(lang, "保存修改", "Save Changes"), Some("Ctrl+S")),
+                        (t(lang, "系统偏好", "Preferences"), None),
+                        (t(lang, "退出 VideoTag", "Quit VideoTag"), Some("Ctrl+Q")),
+                    ]);
+                    ui.set_min_width(w);
+                    ui.set_max_width(w);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if menu_row(ui, t(lang, "添加目录…", "Add Folder…"), Some("Ctrl+O"), false, !self.busy()) {
+                        self.pick_root_dialog();
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "保存修改", "Save Changes"), Some("Ctrl+S"), false,
+                        !self.busy() && self.rows.iter().any(|r| r.checked && r.preview.is_some())) {
+                        self.show_save_dialog = true;
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "系统偏好", "Preferences"), None, false, true) {
+                        self.show_settings = true;
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "退出 VideoTag", "Quit VideoTag"), Some("Ctrl+Q"), false, true) {
+                        self.wants_quit = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button(t(lang, "编辑", "Edit"), |ui| {
+                    let w = menu_width(ui, &[
+                        (t(lang, "全选", "Select All"), None),
+                        (t(lang, "反选", "Invert Selection"), None),
+                        (t(lang, "移除", "Remove"), None),
+                        (t(lang, "指定 ID…", "Set ID…"), None),
+                        (t(lang, "用 TMDB 匹配", "Match with TMDB"), None),
+                        (t(lang, "用 TVDB 匹配", "Match with TVDB"), None),
+                        (t(lang, "用 Bangumi 匹配", "Match with Bangumi"), None),
+                    ]);
+                    ui.set_min_width(w);
+                    ui.set_max_width(w);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let has_rows = !self.rows.is_empty();
+                    let can_edit = has_rows && !self.busy();
+                    if menu_row(ui, t(lang, "全选", "Select All"), None, false, can_edit) {
+                        for row in &mut self.rows {
+                            row.checked = true;
+                        }
+                        ui.close_menu();
+                    }
+                    if menu_row(ui, t(lang, "反选", "Invert Selection"), None, false, can_edit) {
+                        for row in &mut self.rows {
+                            row.checked = !row.checked;
+                        }
+                        ui.close_menu();
+                    }
+                    if menu_row(ui, t(lang, "移除", "Remove"), None, false, self.any_checked() && !self.busy()) {
+                        self.remove_checked();
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "指定 ID…", "Set ID…"), None, false,
+                        has_rows && self.any_checked() && !self.busy()) {
+                        self.id_input.clear();
+                        self.id_platform = self.last_platform;
+                        self.show_id_dialog = true;
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "用 TMDB 匹配", "Match with TMDB"), None, false, !self.busy()) {
+                        self.start_match(IdPlatform::Tmdb);
+                        ui.close_menu();
+                    }
+                    if menu_row(ui, t(lang, "用 TVDB 匹配", "Match with TVDB"), None, false, !self.busy()) {
+                        self.start_match(IdPlatform::Tvdb);
+                        ui.close_menu();
+                    }
+                    if menu_row(ui, t(lang, "用 Bangumi 匹配", "Match with Bangumi"), None, false, !self.busy()) {
+                        self.start_match(IdPlatform::Bangumi);
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button(t(lang, "帮助", "Help"), |ui| {
+                    let w = menu_width(ui, &[
+                        (t(lang, "关于 VideoTag", "About VideoTag"), None),
+                        (t(lang, "作者主页", "Author's Homepage"), None),
+                        (t(lang, "在GitHub上查看", "View on GitHub"), None),
+                    ]);
+                    ui.set_min_width(w);
+                    ui.set_max_width(w);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    if menu_row(ui, t(lang, "关于 VideoTag", "About VideoTag"), None, false, true) {
+                        self.show_about = true;
+                        ui.close_menu();
+                    }
+                    menu_sep(ui);
+                    if menu_row(ui, t(lang, "作者主页", "Author's Homepage"), None, false, true) {
+                        open_url("https://mrben.net");
+                        ui.close_menu();
+                    }
+                    if menu_row(ui, t(lang, "在GitHub上查看", "View on GitHub"), None, false, true) {
+                        open_url("https://github.com/i-love-osaka/VideoTag");
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+    }
+}
+
 impl eframe::App for VideoTagApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.skew_measured {
@@ -3496,7 +4854,11 @@ impl eframe::App for VideoTagApp {
             self.field_margin_top = 2 + skew.round().clamp(0.0, 3.0) as i8;
         }
         #[cfg(target_os = "macos")]
-        self.native_menu_update();
+        self.native_menu_update(None);
+        #[cfg(not(target_os = "macos"))]
+        self.menu_bar(ctx);
+        #[cfg(target_os = "windows")]
+        self.apply_titlebar_once(_frame);
         if self.wants_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -3513,14 +4875,19 @@ impl eframe::App for VideoTagApp {
             self.id_dialog_window(ctx);
         }
         self.poll_match(ctx);
+        self.poll_apply(ctx);
         self.poll_enrich(ctx);
         self.poll_probe(ctx);
+        self.poll_scan(ctx);
         self.poll_execute(ctx);
         if self.picker.is_some() {
             self.picker_window(ctx);
         }
         if self.exec_running {
             self.exec_progress_modal(ctx);
+        }
+        if self.batch_running {
+            self.match_progress_modal(ctx);
         }
         // Folders dropped onto the window become library roots —
         // and, like the Add Folder dialog, start from a clean list
@@ -3748,7 +5115,14 @@ impl eframe::App for VideoTagApp {
             let mut clicked: Option<usize> = None;
             let mut more_clicked: Option<usize> = None;
             let mut toggles: Vec<usize> = Vec::new();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            // Virtualized: only the visible rows are laid out.
+            // Rendering every row every frame made libraries of
+            // thousands of files crawl (and look frozen).
+            egui::ScrollArea::vertical().show_rows(
+                ui,
+                46.0,
+                self.rows.len(),
+                |ui, row_range| {
                 let dark = ui.visuals().dark_mode;
                 let zebra = if dark {
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 6)
@@ -3774,7 +5148,8 @@ impl eframe::App for VideoTagApp {
                 };
                 let font = egui::FontId::proportional(14.0);
                 let font12 = egui::FontId::proportional(12.0);
-                for (i, row) in self.rows.iter().enumerate() {
+                for i in row_range {
+                    let row = &self.rows[i];
                     let work = &self.works[row.work];
                     let width = ui.available_width();
                     let (rect, response) =
@@ -3845,7 +5220,10 @@ impl eframe::App for VideoTagApp {
                         }
                     } else if row.done {
                         (t(self.lang, "已完成", "Done").to_string(), green)
-                    } else if work.searching {
+                    } else if work.searching && (row.preview.is_none() || row.ep_missing) {
+                        // Still waiting for this row's season to
+                        // stream in (rows whose names already
+                        // landed fall through to "matched" below).
                         (t(self.lang, "匹配中…", "Matching…").to_string(), dim_color)
                     } else if row.ep_missing {
                         (t(self.lang, "TMDB 无此集", "Not on TMDB").to_string(), amber)
@@ -4597,10 +5975,22 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
+    // Windows: opt into the system app mode before any menu is
+    // created, so the native menu renders in the system theme.
+    #[cfg(target_os = "windows")]
+    windows_apply_app_mode();
+
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
+    // Windows shows the app name and version in the title bar;
+    // macOS keeps the title empty (traffic lights only).
+    let title = if cfg!(target_os = "windows") {
+        format!("VideoTag {}", env!("CARGO_PKG_VERSION"))
+    } else {
+        String::new()
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("")
+            .with_title(title)
             .with_inner_size([1280.0, 840.0])
             .with_min_inner_size([1024.0, 700.0])
             .with_icon(icon.unwrap_or_default()),
@@ -4731,6 +6121,203 @@ fn show_about_window(ctx: &egui::Context, show_about: &mut bool, lang: Lang) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_refresh_previews_only_the_finished_work() {
+        let root = PathBuf::from("/nas/lib");
+        let mut app = VideoTagApp::default();
+        for w in 0..2usize {
+            let parsed =
+                videotag_core::parse_directory_name(&format!("Show {w}"));
+            let work = Work::new(parsed, Method::Id, true);
+            app.works.push(work);
+            for e in 1..=3usize {
+                let file = format!("Show {w} - S01E{e:02}.mkv");
+                app.rows.push(Row {
+                    path: root.join(format!("Show {w}")).join(&file),
+                    root: root.clone(),
+                    work: w,
+                    name: file.clone(),
+                    parsed: videotag_core::parse_file_name(&file),
+                    subtitles: Vec::new(),
+                    small: false,
+                    media_tags: None,
+                    checked: true,
+                    preview: None,
+                    conflict: false,
+                    conflict_kind: None,
+                    ep_missing: false,
+                    done: false,
+                    exec_error: None,
+                });
+            }
+        }
+        app.refresh_previews();
+        assert!(app.rows.iter().all(|r| r.preview.is_none()));
+        // "Match" work 0 only, the way poll_match now applies a
+        // result: its rows gain previews, work 1's stay empty.
+        app.works[0].candidates = vec![videotag_sources::Candidate {
+            id: 4242,
+            source: IdPlatform::Tmdb,
+            media_type: MediaType::Tv,
+            title: "剧名零".to_string(),
+            original_title: "Show 0".to_string(),
+            year: Some(2020),
+            overview: String::new(),
+            popularity: 1.0,
+            vote_average: 8.5,
+            vote_count: 100,
+            english_title: "Show 0".to_string(),
+        }];
+        app.works[0].chosen = Some(0);
+        app.refresh_work_previews(0);
+        assert!(app
+            .rows
+            .iter()
+            .filter(|r| r.work == 0)
+            .all(|r| r.preview.is_some()));
+        assert!(app
+            .rows
+            .iter()
+            .filter(|r| r.work == 1)
+            .all(|r| r.preview.is_none()));
+    }
+
+    #[test]
+    fn apply_pass_writes_stashed_results_into_the_list() {
+        let root = PathBuf::from("/nas/lib");
+        let mut app = VideoTagApp::default();
+        for w in 0..2usize {
+            let parsed =
+                videotag_core::parse_directory_name(&format!("Show {w}"));
+            app.works.push(Work::new(parsed, Method::Id, true));
+            for e in 1..=3usize {
+                let file = format!("Show {w} - S01E{e:02}.mkv");
+                app.rows.push(Row {
+                    path: root.join(format!("Show {w}")).join(&file),
+                    root: root.clone(),
+                    work: w,
+                    name: file.clone(),
+                    parsed: videotag_core::parse_file_name(&file),
+                    subtitles: Vec::new(),
+                    small: false,
+                    media_tags: None,
+                    checked: true,
+                    preview: None,
+                    conflict: false,
+                    conflict_kind: None,
+                    ep_missing: false,
+                    done: false,
+                    exec_error: None,
+                });
+            }
+        }
+        // The batch stashed one success (work 0) and one failure
+        // (work 1); nothing has been applied to the list yet.
+        let cand = videotag_sources::Candidate {
+            id: 4242,
+            source: IdPlatform::Tmdb,
+            media_type: MediaType::Tv,
+            title: "剧名零".to_string(),
+            original_title: "Show 0".to_string(),
+            year: Some(2020),
+            overview: String::new(),
+            popularity: 1.0,
+            vote_average: 8.5,
+            vote_count: 100,
+            english_title: "Show 0".to_string(),
+        };
+        let ep = |number: u32, title: &str| Episode {
+            number,
+            title: title.to_string(),
+            air_date: None,
+        };
+        app.apply = Some(ApplyState {
+            queue: VecDeque::from([
+                PendingResult::Done {
+                    work: 0,
+                    candidates: vec![cand],
+                    chosen: 0,
+                    detail: None,
+                    episodes: vec![(
+                        1,
+                        vec![ep(1, "Pilot"), ep(2, "Second"), ep(3, "Third")],
+                    )],
+                },
+                PendingResult::Failed { work: 1 },
+            ]),
+            current: None,
+            final_status: "SUMMARY".to_string(),
+            works_total: 2,
+            works_done: 0,
+        });
+        let ctx = egui::Context::default();
+        for _ in 0..1000 {
+            if app.apply.is_none() {
+                break;
+            }
+            app.poll_apply(&ctx);
+        }
+        assert!(app.apply.is_none(), "apply pass drains");
+        assert_eq!(app.status, "SUMMARY");
+        assert!(app.works[0].matched().is_some());
+        assert!(app
+            .rows
+            .iter()
+            .filter(|r| r.work == 0)
+            .all(|r| r.preview.is_some()));
+        assert!(app.works[1].failed);
+        assert!(app
+            .rows
+            .iter()
+            .filter(|r| r.work == 1)
+            .all(|r| r.preview.is_none()));
+    }
+
+    #[test]
+    fn collect_walks_real_files_and_skips_symlink_cycles() {
+        let base = std::env::temp_dir().join(format!(
+            "videotag-collect-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let show = base.join("Show");
+        let season = show.join("Season 1");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(season.join("01.mkv"), b"x").unwrap();
+        std::fs::write(season.join("02.mkv"), b"x").unwrap();
+        std::fs::write(show.join("movie.mp4"), b"x").unwrap();
+        // A directory symlink pointing back at an ancestor: the
+        // old walk followed it forever and overflowed the stack.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&show, season.join("loop")).unwrap();
+        let (mut videos, mut subs) = (Vec::new(), Vec::new());
+        collect_work_files(&show, &mut videos, &mut subs);
+        assert_eq!(videos.len(), 3, "{videos:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_survives_deep_trees() {
+        let base = std::env::temp_dir().join(format!(
+            "videotag-deep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut dir = base.clone();
+        for i in 0..80 {
+            dir = dir.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bottom.mkv"), b"x").unwrap();
+        std::fs::write(base.join("top.mkv"), b"x").unwrap();
+        let (mut videos, mut subs) = (Vec::new(), Vec::new());
+        collect_work_files(&base, &mut videos, &mut subs);
+        // Top file found; the walk stops at the depth cap
+        // instead of recursing without bound.
+        assert!(videos.iter().any(|p| p.ends_with("top.mkv")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn junk_directories_are_filtered_but_seasons_stay() {
@@ -5364,7 +6951,7 @@ mod tests {
             PathBuf::from("/out/Folder/ep.mkv"),
         ];
         assert_eq!(
-            conflicting_kinds(&srcs, &tgts),
+            conflicting_kinds(&srcs, &tgts, &mut HashMap::new()),
             vec![
                 Some(ConflictKind::Duplicate),
                 Some(ConflictKind::Duplicate)
@@ -5385,19 +6972,28 @@ mod tests {
         // for both and outranks the exists rule; check the
         // exists rule in isolation below.
         assert_eq!(
-            conflicting_kinds(&srcs, &tgts),
+            conflicting_kinds(&srcs, &tgts, &mut HashMap::new()),
             vec![
                 Some(ConflictKind::Duplicate),
                 Some(ConflictKind::Duplicate)
             ]
         );
-        let kinds = conflicting_kinds(&[base.join("src.mkv")], &[taken.clone()]);
+        let kinds = conflicting_kinds(
+            &[base.join("src.mkv")],
+            &[taken.clone()],
+            &mut HashMap::new(),
+        );
         assert_eq!(kinds, vec![Some(ConflictKind::TargetExists)]);
-        let kinds = conflicting_kinds(&[taken.clone()], &[taken.clone()]);
+        let kinds = conflicting_kinds(
+            &[taken.clone()],
+            &[taken.clone()],
+            &mut HashMap::new(),
+        );
         assert_eq!(kinds, vec![None]);
         let kinds = conflicting_kinds(
             &[base.join("src.mkv")],
             &[base.join("free.mkv")],
+            &mut HashMap::new(),
         );
         assert_eq!(kinds, vec![None]);
         let _ = std::fs::remove_dir_all(&base);
